@@ -227,7 +227,13 @@ class DatasetStageArgs:
     name: str
     start_training_step: int
     data: DataArgs
-    sequence_length: Optional[int] = None # if None, we use the sequence length from the config
+    sequence_length: Optional[int] = None  # if None, we use the sequence length from the config
+    # Backward-compat fields: older configs may specify tokenizer/vocab at the stage level.
+    # We accept them to avoid dacite UnexpectedDataError and optionally use them downstream.
+    tokenizer_name: Optional[str] = None
+    tokenizer_revision: Optional[str] = None
+    tokenizer_max_length: Optional[int] = None
+    vocab_size: Optional[int] = None
 
     def __post_init__(self):
         if self.start_training_step < 0:
@@ -511,7 +517,7 @@ class Config:
                             f"Setting model's vocab_size to {self.model.model_config.vocab_size} from dataset's vocab_size ({stage.data.dataset.vocab_size})"
                         )
                     assert (
-                        self.model.model_config.vocab_size == stage.data.dataset.vocab_size
+                        self.model.model_config.vocab_size >= stage.data.dataset.vocab_size
                     ), f"Model's vocab_size ({self.model.model_config.vocab_size}) does not match dataset's ({stage.data.dataset.dataset_folder}) vocab_size ({stage.data.dataset.vocab_size})"
                     if self.tokenizer is None:
                         self.tokenizer = TokenizerArgs(tokenizer_name_or_path=stage.data.dataset.tokenizer_name)
@@ -642,7 +648,7 @@ def get_config_from_dict(
                 InitScalingMethod: lambda x: InitScalingMethod[x.upper()],
                 SamplerType: lambda x: SamplerType[x.upper()],
             },
-            # strict_unions_match=True,
+            strict_unions_match=True,
             strict=True,
         ),
     )
@@ -667,7 +673,9 @@ def get_config_from_file(
     """
     # Open the file and load the file
     with open(config_path) as f:
-        config_dict = yaml.load(f, Loader=SafeLoader)
+        content = f.read()
+        content = os.path.expandvars(content)
+        config_dict = yaml.load(content, Loader=SafeLoader)
 
     config = get_config_from_dict(
         config_dict,

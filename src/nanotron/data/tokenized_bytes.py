@@ -418,19 +418,19 @@ class TokenizedBytesFolderDataset(DatatroveFolderDataset):
                     raise RuntimeError(f"Failed to read cache file on rank {dist.get_rank()}: {e}")
 
         super().__init__(
-            folder_path=folder_path,
+            data_folder=folder_path,
             seq_len=seq_len,
             filename_pattern=filename_pattern,
             recursive=recursive,
             token_size=token_size,
-            max_tokens=max_tokens,
+            # max_tokens=max_tokens,
             shuffle=shuffle,
             seed=seed,
             return_positions=return_positions,
-            eos_token_id=eos_token_id,
-            read_path=folder_read_path,
-            matched_files=matched_files,
-            file_sizes=file_sizes,
+            positions_from_eos_token_id=eos_token_id,
+            # read_path=folder_read_path,
+            # matched_files=matched_files,
+            # file_sizes=file_sizes,
         )
 
         self.subset_log = TBFolderDatasetLog(

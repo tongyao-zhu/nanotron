@@ -140,10 +140,17 @@ class BlendableDataset(torch.utils.data.Dataset):
         return self.size
 
     def __getitem__(self, idx):
+        # Cycle through the dataset if idx exceeds size (multi-epoch training)
+        idx = idx % self.size
         dataset_idx = self.dataset_index[idx]
         sample_idx = self.dataset_sample_index[idx]
 
-        return self.datasets[dataset_idx][sample_idx + self.offsets_in_samples[dataset_idx]] # TODO: is it okay to not respect dataset_sample_index? Since it's sequential it's okay for now
+        # Also wrap sample_idx within the underlying dataset's bounds
+        underlying_dataset = self.datasets[dataset_idx]
+        effective_idx = sample_idx + self.offsets_in_samples[dataset_idx]
+        effective_idx = effective_idx % len(underlying_dataset)
+
+        return underlying_dataset[effective_idx]
 
     # @property
     # def last_file_idx(self):
@@ -184,9 +191,6 @@ class BlendableDataset(torch.utils.data.Dataset):
         """
         stats = {}
         for dataset_idx, dataset in enumerate(self.datasets):
-            assert (
-                "s3" in dataset.folder_path
-            ), "Only S3 paths are supported for consumption stats"  # TODO: remove this
             stats[dataset.folder_path] = {"tokens": self.consumed_tokens[dataset_idx]}
         return stats
 

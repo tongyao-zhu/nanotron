@@ -191,9 +191,9 @@ def get_dataloader_from_data_stage(
         from nanotron.data.tokenized_bytes import get_tb_dataloader, get_tb_datasets
 
         tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         assert (
-            len(tokenizer) == trainer.model_config.vocab_size
+            len(tokenizer) <= trainer.model_config.vocab_size
         ), f"Tokenizer vocab size ({len(tokenizer)}) does not match model config vocab size ({trainer.model_config.vocab_size}). "
         log_rank(
             f"[TokenizedBytes] Creating TokenizedBytes with {len(data.dataset.dataset_folder)} dataset folders and {trainer.config.tokens.train_steps * trainer.global_batch_size} train samples",

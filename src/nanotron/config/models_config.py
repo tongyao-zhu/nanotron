@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import List, Optional, Union
 
 from nanotron.config.utils_config import InitScalingMethod
 from nanotron.nn.attention import ALL_ATTENTION_FUNCTIONS, AttentionImplementation
@@ -289,4 +289,4 @@ class Starcoder2Config:
         return self.intermediate_size
 
 
-NanotronConfigs = Union[LlamaConfig, Starcoder2Config, Qwen2Config, Any]
+NanotronConfigs = Union[LlamaConfig, Starcoder2Config, Qwen2Config]
