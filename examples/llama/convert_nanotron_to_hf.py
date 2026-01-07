@@ -137,7 +137,7 @@ def convert_checkpoint_and_save(
 
     # Copy weights, initialize tokenizer and save model.
     if tokenizer_name is not None:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
         tokenizer.save_pretrained(save_path)
     convert_nt_to_hf(nanotron_model, hf_model, model_config)
     hf_model.save_pretrained(save_path)
@@ -148,11 +148,11 @@ def check_converted_model_generation(save_path: Path):
     """Loads a huggingface model and tokenizer from `save_path` and
     performs a dummy text generation."""
 
-    tokenizer = AutoTokenizer.from_pretrained(save_path)
+    tokenizer = AutoTokenizer.from_pretrained(save_path, trust_remote_code=True)
     input_ids = tokenizer(TEST_PROMPT, return_tensors="pt")["input_ids"].cuda()
     print("Inputs:", tokenizer.batch_decode(input_ids))
 
-    model = LlamaForCausalLM.from_pretrained(save_path).cuda().bfloat16()
+    model = LlamaForCausalLM.from_pretrained(save_path, trust_remote_code=True).cuda().bfloat16()
     out = model.generate(input_ids, max_new_tokens=100)
     print("Generation (converted): ", tokenizer.batch_decode(out))
 
@@ -163,6 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", type=Path, default="llama-7b-hf", help="Path to save the HF model")
     parser.add_argument("--tokenizer_name", type=str, default="meta-llama/Llama-2-7b-chat-hf")
     parser.add_argument("--config_cls", type=str, default="LlamaConfig", help="Config class to use for conversion (Either LlamaConfig or Qwen2Config)")
+    parser.add_argument("--run_generation", action="store_true", help="Run generation to check if the conversion was successful")
     args = parser.parse_args()
 
     if args.config_cls == "LlamaConfig":
@@ -178,5 +179,5 @@ if __name__ == "__main__":
     )
 
     # Check if the conversion was successful by generating some text.
-    if args.tokenizer_name is not None:
+    if args.tokenizer_name is not None and args.run_generation:
         check_converted_model_generation(save_path=args.save_path)

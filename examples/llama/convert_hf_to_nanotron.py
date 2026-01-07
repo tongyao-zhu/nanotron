@@ -5,6 +5,9 @@ Command:
 """
 
 import dataclasses
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).parent))
 import json
 from argparse import ArgumentParser
 from pathlib import Path
@@ -17,7 +20,7 @@ from nanotron.models.llama import LlamaForTraining
 from transformers import LlamaConfig as HFLlamaConfig
 from transformers import LlamaForCausalLM
 
-from .convert_weights import get_config_mapping, get_weight_mapping, load_nanotron_model
+from convert_weights import get_config_mapping, get_weight_mapping, load_nanotron_model
 
 
 def _handle_attention_block(
@@ -91,10 +94,10 @@ def convert_hf_to_nt(
                 param_nt.copy_(param)
 
 
-def get_nanotron_config(config: HFLlamaConfig) -> NanotronQwen2Config:
+def get_nanotron_config(config: HFLlamaConfig) -> NanotronLlamaConfig:
     """Converts a huggingface configuration to nanotron configuration."""
     attrs = {key: getattr(config, value) for key, value in get_config_mapping(nt_to_hf=True).items()}
-    return NanotronQwen2Config(**attrs)
+    return NanotronLlamaConfig(**attrs)
 
 
 def convert_checkpoint_and_save(checkpoint_path: Path, save_path: Path):
