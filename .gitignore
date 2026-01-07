@@ -161,7 +161,7 @@ cython_debug/
 
 .vscode
 
-checkpoints/
+checkpoints*/
 wandb/
 logs/
 .test_cache/
@@ -170,3 +170,4 @@ datatrove/
 eval_results/
 tb_logs/
 .nanoset_cache/
+nanotron_models/
