@@ -8,10 +8,16 @@ export MASTER_PORT=14432
 path=$1
 
 # if save_path exists and is not empty, skip
-if [ -d "$path\_hf" ] && [ -n "$(ls -A $path\_hf)" ]; then
-    echo "Skipping $path because it already exists"
+
+hf_path="${path}_hf"
+
+if [ -d "$hf_path" ] && [ -n "$(ls -A "$hf_path")" ]; then
+    echo "Skipping $path because $hf_path already exists and is not empty"
     exit 0
 fi
+
+echo "Converting $path to $hf_path because output directory $hf_path is empty or does not exist"
+
 
 if [[ "$path" == *opencoder* ]]; then
     tokenizer_name="tyzhu/opencoder484"

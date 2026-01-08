@@ -1,5 +1,5 @@
 #!/bin/bash
-source /home/aiops/zhuty/nanotron/nano_start.sh
+source /home/aiops/zhuty/nano_start.sh
 cd /home/aiops/zhuty/nanotron
 
 base_path=$1
