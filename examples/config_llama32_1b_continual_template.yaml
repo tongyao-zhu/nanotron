@@ -31,7 +31,7 @@ model:
   ddp_bucket_cap_mb: 25
   make_vocab_size_divisible_by: 1
   init_method:
-    path: /home/aiops/zhuty/nanotron/checkpoints/llama32-1b-nt
+    ${INIT_KEY}: ${INIT_VALUE}
   model_config:
     bos_token_id: 128000
     eos_token_id: 128001

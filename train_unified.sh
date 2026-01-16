@@ -28,6 +28,11 @@ echo "--------------------------------"
 NNODES=${NUM_NODES:-1}
 echo "Nodes: $NNODES"
 
+if [ -f "/home/aiops/zhuty/THIS_IS_MY.txt" ] && [ $num_nodes -gt 1 ]; then
+    echo "THIS_IS_MY.txt exists, setting NCCL_SOCKET_IFNAME to bond0"
+    export NCCL_SOCKET_IFNAME=bond0
+fi
+
 # 0. Parse sequence length from ADDITIONAL_ARGS
 SEQ_LENGTH_ARG="8k"  # default
 if [[ "$ADDITIONAL_ARGS" =~ --length[[:space:]]+([0-9]+k) ]]; then
@@ -82,6 +87,7 @@ export IS_DIFFUSION=false
 export MASK_TOKEN_ID=-1
 export ZERO_STAGE=0
 export ACCUMULATE_GRAD_IN_FP32=true
+export IS_SCRATCH=false
 
 # Parse Additional Args
 if [[ "$ADDITIONAL_ARGS" == *"--diffusion"* ]]; then
@@ -89,6 +95,12 @@ if [[ "$ADDITIONAL_ARGS" == *"--diffusion"* ]]; then
     SUFFIX="${SUFFIX}_diff"
     export MASK_TOKEN_ID=128255
     echo "  Mode: Diffusion"
+fi
+
+if [[ "$ADDITIONAL_ARGS" == *"--scratch"* ]]; then
+    export IS_SCRATCH=true
+    SUFFIX="${SUFFIX}-scratch"
+    echo "  Mode: Scratch"
 fi
 
 if [[ "$ADDITIONAL_ARGS" == *"--intradoc"* ]]; then
@@ -121,6 +133,16 @@ echo "Run Suffix: $SUFFIX"
 # 3. Setup Config and Data
 CONFIG_FILE="examples/config_llama32_1b_continual_template.yaml"
 DATASET_FOLDER="/home/aiops/zhuty/cont_data/${DATASET_NAME}/llama_tokenized"
+
+# if from scratch set the key and value
+if [ "$IS_SCRATCH" = true ]; then
+    export INIT_KEY="std"
+    export INIT_VALUE=0.025
+else
+    export INIT_KEY="path"
+    export INIT_VALUE="/home/aiops/zhuty/nanotron/checkpoints/llama32-1b-nt"
+fi
+
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "Error: Config file not found: $CONFIG_FILE"
