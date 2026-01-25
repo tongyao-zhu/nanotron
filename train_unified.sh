@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Usage: ./train_unified.sh <DATASET_NAME> [MODEL_SIZE] [NNODES] [ADDITIONAL_ARGS]
-# Example: ./train_unified.sh my_dataset 1b 4 "--zero1 --length 2k"
+# Example: ./train_unified.sh my_dataset 1b 4 "--zero1 --length 2k --lr 1e-4"
 
 DATASET_NAME=$1
 MODEL_SIZE=${2:-1b}
@@ -84,10 +84,13 @@ export DATASET_NAME
 # Default Env Vars for Config
 export INTRADOC=false
 export IS_DIFFUSION=false
+export IS_BLOCK_DIFFUSION=false
+export BLOCK_SIZE=16
 export MASK_TOKEN_ID=-1
 export ZERO_STAGE=0
 export ACCUMULATE_GRAD_IN_FP32=true
 export IS_SCRATCH=false
+export LEARNING_RATE=5.0e-05  # default learning rate
 
 # Parse Additional Args
 if [[ "$ADDITIONAL_ARGS" == *"--diffusion"* ]]; then
@@ -95,6 +98,18 @@ if [[ "$ADDITIONAL_ARGS" == *"--diffusion"* ]]; then
     SUFFIX="${SUFFIX}_diff"
     export MASK_TOKEN_ID=128255
     echo "  Mode: Diffusion"
+fi
+
+# Parse Block Size (implies Block Diffusion)
+if [[ "$ADDITIONAL_ARGS" =~ --block-size[[:space:]]+([0-9]+) ]]; then
+    export BLOCK_SIZE="${BASH_REMATCH[1]}"
+    export IS_BLOCK_DIFFUSION=true
+    # Ensure Mask Token is set if not already (implies diffusion mode usually)
+    if [ "$MASK_TOKEN_ID" -eq -1 ]; then
+        export MASK_TOKEN_ID=128255
+    fi
+    SUFFIX="${SUFFIX}_blk${BLOCK_SIZE}"
+    echo "  Mode: Block Diffusion (Size: $BLOCK_SIZE)"
 fi
 
 if [[ "$ADDITIONAL_ARGS" == *"--scratch"* ]]; then
@@ -116,10 +131,22 @@ if [[ "$ADDITIONAL_ARGS" == *"--zero1"* ]]; then
     echo "  Mode: Zero1"
 fi
 
+# Parse Learning Rate
+if [[ "$ADDITIONAL_ARGS" =~ --lr[[:space:]]+([0-9.eE+-]+) ]]; then
+    export LEARNING_RATE="${BASH_REMATCH[1]}"
+    echo "  Learning Rate: $LEARNING_RATE"
+fi
+
 # Append sequence length to suffix if not default (8k)
 if [ "$SEQ_LENGTH_ARG" != "8k" ]; then
     SUFFIX="${SUFFIX}-${SEQ_LENGTH_ARG}"
     echo "  Sequence Length: ${SEQ_LENGTH_ARG}"
+fi
+
+# Append learning rate to suffix if not default (5.0e-05)
+if [ "$LEARNING_RATE" != "5.0e-05" ]; then
+    SUFFIX="${SUFFIX}_lr${LEARNING_RATE}"
+    echo "  Custom Learning Rate: ${LEARNING_RATE}"
 fi
 
 # Append node count to suffix if > 1 for clarity
@@ -129,6 +156,8 @@ fi
 
 export SUFFIX
 echo "Run Suffix: $SUFFIX"
+
+
 
 # 3. Setup Config and Data
 CONFIG_FILE="examples/config_llama32_1b_continual_template.yaml"

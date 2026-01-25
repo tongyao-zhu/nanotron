@@ -76,6 +76,8 @@ model:
     diffusion_config:
       diffusion: ${IS_DIFFUSION}
       mask_token_id: ${MASK_TOKEN_ID}
+      block_diffusion: ${IS_BLOCK_DIFFUSION}
+      block_size: ${BLOCK_SIZE}
 
 optimizer:
   accumulate_grad_in_fp32: ${ACCUMULATE_GRAD_IN_FP32}
@@ -88,7 +90,7 @@ optimizer:
     adam_eps: 1.0e-08
     torch_adam_is_fused: true
   learning_rate_scheduler:
-    learning_rate: 5.0e-05
+    learning_rate: ${LEARNING_RATE}
     lr_warmup_steps: 100
     lr_warmup_style: linear
     lr_decay_style: linear
