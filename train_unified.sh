@@ -28,9 +28,12 @@ echo "--------------------------------"
 NNODES=${NUM_NODES:-1}
 echo "Nodes: $NNODES"
 
-if [ -f "/home/aiops/zhuty/THIS_IS_MY.txt" ] && [ $num_nodes -gt 1 ]; then
+if [ -f "/home/aiops/zhuty/THIS_IS_MY.txt" ] && [ "$NNODES" -gt 1 ]; then
     echo "THIS_IS_MY.txt exists, setting NCCL_SOCKET_IFNAME to bond0"
     export NCCL_SOCKET_IFNAME=bond0
+    export NCCL_DEBUG=INFO
+    export GLOO_SOCKET_IFNAME=bond0
+    export TP_SOCKET_IFNAME=bond0
 fi
 
 # 0. Parse sequence length from ADDITIONAL_ARGS
@@ -166,17 +169,46 @@ if [ "$NNODES" -gt 1 ]; then
     : "${MASTER_PORT:=29500}"
     : "${RANK:=0}"
 
+    # Resolve hostname to IP. Only run this in MY
+    if [ -f "/home/aiops/zhuty/THIS_IS_MY.txt" ]; then
+        echo "  Resolving master hostname to IP address..."
+        RESOLVED_IP=$(python3 -c "import socket; print(socket.gethostbyname('$MASTER_ADDR'))" 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$RESOLVED_IP" ]; then
+            echo "  Resolved $MASTER_ADDR -> $RESOLVED_IP"
+            MASTER_ADDR=$RESOLVED_IP
+        else
+            echo "  WARNING: Could not resolve hostname, using as-is: $MASTER_ADDR"
+        fi
+    fi
+
     echo "  Master: $MASTER_ADDR:$MASTER_PORT"
     echo "  Rank: $RANK"
 
     # Connectivity Check
     if [ "$RANK" -ne 0 ]; then
-        echo "  Checking connectivity to master..."
-        ping -c 3 $MASTER_ADDR || echo "  WARNING: Ping to master failed"
+        echo "  Checking connectivity to master $MASTER_ADDR:$MASTER_PORT..."
+        if python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(10); result = s.connect_ex(('$MASTER_ADDR', int('$MASTER_PORT'))); exit(result)"; then
+             echo "  SUCCESS: Connected to master $MASTER_ADDR:$MASTER_PORT"
+        else
+             echo "  ERROR: Could not connect to master $MASTER_ADDR:$MASTER_PORT"
+             echo "         Possible causes:"
+             echo "         1. Master node is not running yet."
+             echo "         2. Firewall is blocking port $MASTER_PORT."
+             echo "         3. Master is listening on localhost instead of $MASTER_ADDR (check MASTER_ADDR on master)."
+             # We don't exit here to allow torchrun to retry, but this gives a clear warning.
+        fi
     fi
 
     TORCHRUN_ARGS="$TORCHRUN_ARGS --nnodes=$NNODES --node_rank=$RANK --rdzv_id=nanotron_job --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
+    # if on MY use different setups 
+    if [ -f "/home/aiops/zhuty/THIS_IS_MY.txt" ]; then
+        TORCHRUN_ARGS="$TORCHRUN_ARGS --nnodes=$NNODES --node_rank=$RANK --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT"
     
+        # Force IPv4 to avoid connectivity issues
+        export NCCL_SOCKET_FAMILY=AF_INET
+        export GLOO_SOCKET_FAMILY=AF_INET
+    fi
+
     export NCCL_DEBUG=INFO
     export TORCH_DISTRIBUTED_DEBUG=DETAIL
 fi
