@@ -226,13 +226,22 @@ AttentionImplementation = Literal[tuple(ALL_ATTENTION_FUNCTIONS.keys())]
 # TODO @nouamane: optimize this, and make sure it works with flashattn and flexattn
 def get_attention_mask(position_ids, seq_length):
     attention_mask = torch.zeros(seq_length, seq_length, device=position_ids.device)
-    start_indices = torch.where(position_ids == 0)[0]
+    # Robustly detect segment starts: index 0 and any non-increasing reset in position ids
+    pos = position_ids.view(-1)
+    if pos.numel() > seq_length:
+        pos = pos[:seq_length]
+    starts = torch.zeros_like(pos, dtype=torch.bool)
+    starts[0] = True
+    if pos.numel() > 1:
+        starts[1:] = pos[1:] <= pos[:-1]
+    start_indices = torch.nonzero(starts).squeeze(-1).to(torch.int32)
+    if start_indices.numel() == 0:
+        start_indices = torch.tensor([0], dtype=torch.int32, device=pos.device)
     cu_seqlens = torch.cat(
-        [start_indices, torch.tensor([seq_length], dtype=torch.int32, device=start_indices.device)]
+        [start_indices, torch.tensor([pos.numel()], dtype=torch.int32, device=pos.device)]
     ).to(torch.int32)
     # make trius for each document
     for i in range(len(cu_seqlens) - 1):
-        attention_mask[cu_seqlens[i] : cu_seqlens[i + 1], cu_seqlens[i] : cu_seqlens[i + 1]] = torch.tril(
-            torch.ones(cu_seqlens[i + 1] - cu_seqlens[i], cu_seqlens[i + 1] - cu_seqlens[i])
-        )
+        s, e = int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item())
+        attention_mask[s:e, s:e] = torch.tril(torch.ones(e - s, e - s, device=position_ids.device))
     return attention_mask.to(torch.bool), cu_seqlens  # [seq_length, seq_length]

@@ -27,7 +27,13 @@ from torch.utils.checkpoint import CheckpointFunction
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import Config, LlamaConfig, ParallelismArgs
-from nanotron.config.models_config import RandomInit, SpectralMupInit
+from nanotron.config.models_config import RandomInit, SpectralMupInit, DiffusionArgs
+from nanotron.block_diffusion import (
+    calculate_block_ids,
+    apply_block_masking,
+    create_block_diffusion_attention_mask,
+    transition
+)
 from nanotron.generation.generate_store import AttachableStore
 from nanotron.logging import log_rank
 from nanotron.models import NanotronModel
@@ -271,7 +277,64 @@ class CoreAttention(nn.Module):
         value_states: torch.Tensor,  # [batch_size * kv_length, n_local_kv_heads, inner_dim]
         q_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, q_length] (can be broadcasted to that size)
         kv_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, kv_length] (can be broadcasted to that size)
+        doc_ids: Optional[torch.Tensor] = None,
+        diffusion_mode: Optional[torch.Tensor] = None,
     ):
+        if diffusion_mode is not None and diffusion_mode.item() == 2:
+            # Block Diffusion path using manual mask creation and SDPA
+            # Inputs are [batch, seq, heads, dim] because CausalSelfAttention didn't flatten them
+            # We need to create the mask here because passing it through pipeline is expensive/complex
+            
+            batch_size, seq_len, _, _ = query_states.shape
+            device = query_states.device
+            
+            # We need to reconstruct block_size from somewhere or infer it? 
+            # We can't access config here easily without passing it.
+            # But we can infer noisy_len = seq_len // 2
+            noisy_len = seq_len // 2
+            # Infer block_size from doc_ids?
+            # doc_ids is [batch, seq_len]
+            # Actually, calculate_block_ids returns block_ids. 
+            # We need block_size to recreate the mask. 
+            # Or we can pass `block_attn_mask`? But we decided not to pass large tensors.
+            # Wait, `CoreAttention` has `self.config`? No, `self` is `CoreAttention`.
+            # But `CoreAttention` is initialized with `LlamaConfig`.
+            
+            # Use config from initialization
+            # But LlamaConfig doesn't have diffusion_config unless we added it?
+            # Yes, we added it to LlamaConfig.
+            
+            if hasattr(self, 'config') and hasattr(self.config, 'diffusion_config') and self.config.diffusion_config is not None:
+                block_size = self.config.diffusion_config.block_size
+                
+                # Recreate mask
+                # Need doc_boundaries_mask
+                doc_boundaries_mask = None
+                if doc_ids is not None and doc_ids.numel() > 0:
+                    doc_boundaries_mask = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1))
+                
+                block_attn_mask = create_block_diffusion_attention_mask(
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    block_size=block_size,
+                    noisy_len=noisy_len,
+                    device=device,
+                    doc_boundaries=doc_boundaries_mask
+                )
+                
+                # Permute to [batch, heads, seq, dim] for SDPA
+                q = query_states.permute(0, 2, 1, 3)
+                k = key_states.permute(0, 2, 1, 3)
+                v = value_states.permute(0, 2, 1, 3)
+                
+                # SDPA
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=block_attn_mask, dropout_p=0.0
+                )
+                
+                # Permute back to [batch, seq, heads, dim]
+                return attn_output.permute(0, 2, 1, 3)
+
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
         # TODO @thomasw21: Compute once, instead of computing for each layers.
@@ -438,6 +501,11 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         self,
         hidden_states,  # [seq_length, batch_size, hidden_size]
         sequence_mask,  # [batch_size, seq_length]
+        position_ids: Optional[torch.Tensor] = None,
+        mask_positions: Optional[torch.Tensor] = None,
+        noise_weights: Optional[torch.Tensor] = None,
+        doc_ids: Optional[torch.Tensor] = None,
+        diffusion_mode: Optional[torch.Tensor] = None,
     ):
         qkv_states = self.qkv_proj(
             hidden_states
@@ -478,9 +546,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 query_states, key_states, value_states, sequence_mask, batch_size, q_length, store
             )
         else:  # Training case
-            return self._forward_training(query_states, key_states, value_states, sequence_mask, batch_size, q_length)
+            return self._forward_training(
+                query_states, key_states, value_states, sequence_mask, batch_size, q_length,
+                position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode
+            )
 
     def _forward_inference(self, query_states, key_states, value_states, sequence_mask, batch_size, q_length, store):
+        # ... (no change to inference)
         from flash_attn.flash_attn_interface import flash_attn_with_kvcache
 
         assert key_states.requires_grad is False
@@ -672,42 +744,54 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
         return {"hidden_states": output, "sequence_mask": sequence_mask}
 
-    def _forward_training(self, query_states, key_states, value_states, sequence_mask, batch_size, q_length):
+    def _forward_training(self, query_states, key_states, value_states, sequence_mask, batch_size, q_length, 
+                          position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode):
         # Apply rotary embeddings to query/key states
-        # NOTE: The layout is different from models/llama.py which is [batch_size, num_heads, seq_length, d_qk]
-        # Here it is, [batch_size, seq_length, num_heads, d_qk]
-        # [2, batch_size, seq_length, num_heads, d_qk]
         key_value_states = torch.cat([key_states.unsqueeze(0), value_states.unsqueeze(0)], dim=0)
-        # [batch_size, seq_length, 2, num_heads, d_qk]
         key_value_states = key_value_states.permute(1, 2, 0, 3, 4).contiguous()
-        query_states, key_value_states = self.flash_rotary_embedding(query_states, kv=key_value_states)
-        # [batch_size, seq_length, num_heads, d_qk]
+        
+        query_states, key_value_states = self.flash_rotary_embedding(
+            query_states, kv=key_value_states, position_ids=position_ids
+        )
+        
         key_states, value_states = torch.split(key_value_states, 1, dim=2)
 
         q_sequence_mask = sequence_mask
         kv_sequence_mask = sequence_mask
 
         kv_length = key_states.shape[1]
-        # [batch_size, seq_length, num_heads, d_qk]
-        # Shaping for use in `flash-attn` version of flash-attn: `flash_attn_unpadded_func`
-        query_states = query_states.view(
-            batch_size * q_length, self.n_local_q_heads, self.d_qk
-        )  # [batch_size * q_length, self.n_heads, d_qk]
+        
+        # Check diffusion mode (2 = Block Diffusion)
+        if diffusion_mode is not None and diffusion_mode.item() == 2:
+            # Block Diffusion: pass tensors to CoreAttention without reshaping
+            attention_output = self.attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                q_sequence_mask=q_sequence_mask,
+                kv_sequence_mask=kv_sequence_mask,
+                doc_ids=doc_ids,
+                diffusion_mode=diffusion_mode
+            )
+        else:
+            # Standard path
+            query_states = query_states.view(
+                batch_size * q_length, self.n_local_q_heads, self.d_qk
+            )
+            key_states = key_states.view(
+                batch_size * kv_length, self.n_local_kv_heads, self.d_qk
+            )
+            value_states = value_states.view(
+                batch_size * kv_length, self.n_local_kv_heads, self.d_v
+            )
 
-        key_states = key_states.view(
-            batch_size * kv_length, self.n_local_kv_heads, self.d_qk
-        )  # [batch_size * kv_length, self.n_heads, d_qk]
-        value_states = value_states.view(
-            batch_size * kv_length, self.n_local_kv_heads, self.d_v
-        )  # [batch_size * kv_length, self.n_heads, d_v]
-
-        attention_output = self.attention(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            q_sequence_mask=q_sequence_mask,
-            kv_sequence_mask=kv_sequence_mask,
-        )
+            attention_output = self.attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                q_sequence_mask=q_sequence_mask,
+                kv_sequence_mask=kv_sequence_mask,
+            )
 
         attention_output = (
             attention_output.contiguous().view(batch_size, q_length, self.n_local_q_heads * self.d_v).transpose(0, 1)
@@ -743,11 +827,24 @@ class LlamaDecoderLayer(nn.Module):
         self,
         hidden_states: Union[torch.Tensor, TensorPointer],
         sequence_mask: Union[torch.Tensor, TensorPointer],
+        position_ids: Union[torch.Tensor, TensorPointer],
+        mask_positions: Union[torch.Tensor, TensorPointer],
+        noise_weights: Union[torch.Tensor, TensorPointer],
+        doc_ids: Union[torch.Tensor, TensorPointer],
+        diffusion_mode: Union[torch.Tensor, TensorPointer],
     ) -> List[Union[torch.Tensor, TensorPointer]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask)
+        output = self.attn(
+            hidden_states=hidden_states, 
+            sequence_mask=sequence_mask, 
+            position_ids=position_ids,
+            mask_positions=mask_positions,
+            noise_weights=noise_weights,
+            doc_ids=doc_ids,
+            diffusion_mode=diffusion_mode
+        )
         hidden_states = output["hidden_states"]
         hidden_states = hidden_states + residual
 
@@ -756,29 +853,150 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states=hidden_states)["hidden_states"]
         hidden_states = hidden_states + residual
 
-        return hidden_states, output["sequence_mask"]
+        return hidden_states, output["sequence_mask"], position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode
 
     def _checkpointed_forward(
         self,
         hidden_states: torch.Tensor,
         sequence_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        mask_positions: torch.Tensor,
+        noise_weights: torch.Tensor,
+        doc_ids: torch.Tensor,
+        diffusion_mode: torch.Tensor,
     ) -> List[torch.Tensor]:
-        return CheckpointFunction.apply(self._core_forward, True, hidden_states, sequence_mask)
+        return CheckpointFunction.apply(self._core_forward, True, hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode)
 
     def forward(
         self,
         hidden_states: Union[torch.Tensor, TensorPointer],
         sequence_mask: Union[torch.Tensor, TensorPointer],
+        position_ids: Union[torch.Tensor, TensorPointer],
+        mask_positions: Union[torch.Tensor, TensorPointer],
+        noise_weights: Union[torch.Tensor, TensorPointer],
+        doc_ids: Union[torch.Tensor, TensorPointer],
+        diffusion_mode: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
 
         if self.recompute_layer and not isinstance(hidden_states, TensorPointer):
-            hidden_states, sequence_mask = self._checkpointed_forward(hidden_states, sequence_mask)
+            hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode = self._checkpointed_forward(
+                hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode
+            )
         else:
-            hidden_states, sequence_mask = self._core_forward(hidden_states, sequence_mask)
+            hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode = self._core_forward(
+                hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode
+            )
 
         return {
             "hidden_states": hidden_states,
             "sequence_mask": sequence_mask,
+            "position_ids": position_ids,
+            "mask_positions": mask_positions,
+            "noise_weights": noise_weights,
+            "doc_ids": doc_ids,
+            "diffusion_mode": diffusion_mode,
+        }
+
+
+class DiffusionModule(nn.Module):
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
+        self.config = config
+
+    def forward(self, input_ids: torch.Tensor, input_mask: torch.Tensor):
+        device = input_ids.device
+        
+        # Default outputs (dummies for P2P)
+        noisy_input_ids = input_ids
+        input_mask_updated = input_mask
+        position_ids = torch.empty(0, device=device)
+        mask_positions = torch.empty(0, device=device)
+        noise_weights = torch.empty(0, device=device)
+        doc_ids = torch.empty(0, device=device)
+        diffusion_mode = torch.tensor(0, dtype=torch.int, device=device)
+
+        if self.config.diffusion_config is not None:
+            diff_config = self.config.diffusion_config
+            batch_size, seq_len = input_ids.shape
+            
+            # Debug: Check for diffusion trigger
+            if torch.distributed.get_rank() == 0:
+                print(f"DEBUG: DiffusionModule - config present. Diffusion: {diff_config.diffusion}, Block: {diff_config.block_diffusion}")
+
+            if diff_config.block_diffusion:
+                diffusion_mode = torch.tensor(2, dtype=torch.int, device=device)
+                
+                block_size = diff_config.block_size
+                mask_token_id = diff_config.mask_token_id
+                t_lower = diff_config.t_lower
+                t_upper = diff_config.t_upper
+                bos_token_id = self.config.bos_token_id
+                eos_token_id = self.config.eos_token_id
+                
+                # 1. Calculate block IDs
+                block_ids, pos_ids, d_ids = calculate_block_ids(
+                    input_ids, block_size, bos_token_id, eos_token_id
+                )
+                doc_ids = d_ids
+                
+                # 2. Apply block-wise masking
+                masked_input, mask_pos, t_per_position = apply_block_masking(
+                    input_ids, block_ids, t_lower, t_upper, mask_token_id, is_training=True
+                )
+                mask_positions = mask_pos
+                
+                # 3. Concatenate [noisy, clean]
+                noisy_input_ids = torch.cat([masked_input, input_ids], dim=1)
+                input_mask_updated = torch.cat([input_mask, input_mask], dim=1)
+                
+                # 4. Position IDs for RoPE (repeated)
+                position_ids = torch.cat([pos_ids, pos_ids], dim=1)
+                
+                # 5. Noise weights
+                noise_weights = 1.0 / (t_per_position + 1e-3)
+                
+            elif diff_config.diffusion:
+                diffusion_mode = torch.tensor(1, dtype=torch.int, device=device)
+                
+                mask_token_id = diff_config.mask_token_id
+                sampling_eps = diff_config.sampling_eps
+                maskable_mask = input_mask.bool()
+                
+                # Sample noise level until we get at least one masked token
+                # This prevents missing gradients for the token embedding layer
+                max_attempts = 100
+                for attempt in range(max_attempts):
+                    t = (1 - sampling_eps) * torch.rand(batch_size, device=device) + sampling_eps
+                    noisy_input_ids = transition(input_ids, t[:, None], maskable_mask, mask_token_id)
+                    mask_positions = (noisy_input_ids == mask_token_id).long()
+                    
+                    # Check if we have at least one masked token
+                    if mask_positions.sum().item() > 0:
+                        break
+                    
+                    # Safety: if we've tried many times and still no mask, force higher noise
+                    if attempt == max_attempts - 1:
+                        t = torch.full((batch_size,), 0.5, device=device)
+                        noisy_input_ids = transition(input_ids, t[:, None], maskable_mask, mask_token_id)
+                        mask_positions = (noisy_input_ids == mask_token_id).long()
+                
+                noise_weights = torch.reciprocal(t)
+                
+                # Debug: Check masking
+                if torch.distributed.get_rank() == 0:
+                     num_masked = mask_positions.sum().item()
+                     total_tokens = mask_positions.numel()
+                     print(f"DEBUG: Diffusion active. Masked tokens: {num_masked}/{total_tokens} ({num_masked/total_tokens:.2%})")
+
+
+        return {
+            "noisy_input_ids": noisy_input_ids,
+            "input_mask_updated": input_mask_updated,
+            "position_ids": position_ids,
+            "mask_positions": mask_positions,
+            "noise_weights": noise_weights,
+            "doc_ids": doc_ids,
+            "diffusion_mode": diffusion_mode
         }
 
 
@@ -812,6 +1030,7 @@ class Embedding(nn.Module, AttachableStore):
         return {"input_embeds": input_embeds}
 
 
+
 class LlamaModel(nn.Module):
     """Build pipeline graph"""
 
@@ -831,6 +1050,22 @@ class LlamaModel(nn.Module):
         self.tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
         tp_linear_async_communication = (
             parallel_config.tp_linear_async_communication if parallel_config is not None else False
+        )
+
+        self.diffusion_block = PipelineBlock(
+            p2p=self.p2p,
+            module_builder=DiffusionModule,
+            module_kwargs={"config": config},
+            module_input_keys={"input_ids", "input_mask"},
+            module_output_keys={
+                "noisy_input_ids", 
+                "input_mask_updated", 
+                "position_ids", 
+                "mask_positions", 
+                "noise_weights", 
+                "doc_ids", 
+                "diffusion_mode"
+            },
         )
 
         self.token_position_embeddings = PipelineBlock(
@@ -863,8 +1098,24 @@ class LlamaModel(nn.Module):
                         "tp_pg": parallel_context.tp_pg,
                         "layer_idx": layer_idx,
                     },
-                    module_input_keys={"hidden_states", "sequence_mask"},
-                    module_output_keys={"hidden_states", "sequence_mask"},
+                    module_input_keys={
+                        "hidden_states", 
+                        "sequence_mask", 
+                        "position_ids", 
+                        "mask_positions", 
+                        "noise_weights", 
+                        "doc_ids", 
+                        "diffusion_mode"
+                    },
+                    module_output_keys={
+                        "hidden_states", 
+                        "sequence_mask", 
+                        "position_ids", 
+                        "mask_positions", 
+                        "noise_weights", 
+                        "doc_ids", 
+                        "diffusion_mode"
+                    },
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -918,11 +1169,32 @@ class LlamaModel(nn.Module):
     ):
         # all tensors are optional as most ranks don't need anything from the dataloader.
 
-        output = self.token_position_embeddings(input_ids=input_ids, input_mask=input_mask)
+        diff_output = self.diffusion_block(input_ids=input_ids, input_mask=input_mask)
+        
+        # Use noisy_input_ids for embedding if available (Rank 0), or pass through whatever came out
+        # Actually, PipelineBlock forward returns dict.
+        # If rank != 0, diff_output values are TensorPointers.
+        # If rank == 0, they are Tensors.
+        
+        # We need to route noisy_input_ids to Embedding input_ids
+        noisy_input_ids = diff_output["noisy_input_ids"]
+        
+        # Embedding expects "input_ids", "input_mask"
+        # We pass noisy_input_ids as "input_ids"
+        emb_output = self.token_position_embeddings(
+            input_ids=noisy_input_ids, 
+            input_mask=input_mask # Embedding uses input_mask for store['past_length'], keep original?
+            # Actually, for block diffusion we updated input_mask.
+        )
 
         hidden_encoder_states = {
-            "hidden_states": output["input_embeds"],
-            "sequence_mask": input_mask,
+            "hidden_states": emb_output["input_embeds"],
+            "sequence_mask": diff_output["input_mask_updated"],
+            "position_ids": diff_output["position_ids"],
+            "mask_positions": diff_output["mask_positions"],
+            "noise_weights": diff_output["noise_weights"],
+            "doc_ids": diff_output["doc_ids"],
+            "diffusion_mode": diff_output["diffusion_mode"],
         }
         for encoder_block in self.decoder:
             hidden_encoder_states = encoder_block(**hidden_encoder_states)
@@ -933,7 +1205,7 @@ class LlamaModel(nn.Module):
 
         fp32_sharded_logits = self.cast_to_fp32(x=sharded_logits)["output"]
 
-        return fp32_sharded_logits, hidden_states
+        return fp32_sharded_logits, hidden_states, hidden_encoder_states["diffusion_mode"], hidden_encoder_states["mask_positions"], hidden_encoder_states["noise_weights"], hidden_encoder_states["doc_ids"]
 
     def get_block_compute_costs(self):
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
@@ -975,7 +1247,7 @@ class LlamaModel(nn.Module):
 
 @torch.jit.script
 def masked_mean(loss, label_mask, dtype):
-    # type: (Tensor, Tensor, torch.dtype) -> Tensor
+    # type: (torch.Tensor, torch.Tensor, torch.dtype) -> torch.Tensor
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
@@ -989,7 +1261,94 @@ class Loss(nn.Module):
         sharded_logits: torch.Tensor,  # [seq_length, batch_size, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        mask_positions: Optional[torch.Tensor] = None,
+        noise_weights: Optional[torch.Tensor] = None,
+        doc_ids: Optional[torch.Tensor] = None,
+        diffusion_mode: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        if diffusion_mode is not None and diffusion_mode.item() > 0:
+            mode = diffusion_mode.item()
+            # Handle diffusion loss
+            loss = sharded_cross_entropy(
+                sharded_logits,
+                label_ids.transpose(0, 1).contiguous(),
+                group=self.tp_pg,
+                dtype=torch.float,
+            ).transpose(0, 1) # [B, L]
+
+            if mode == 2: # Block Diffusion
+                # For block diffusion, input is concatenated [noisy, clean]. logits are [2L, B, V].
+                # We need to split logits
+                seq_len = label_ids.shape[1] # This is original seq_len
+                # logits are [2*seq_len, batch, vocab]
+                
+                noisy_logits = sharded_logits[:seq_len, :, :] # [L, B, V]
+                clean_logits = sharded_logits[seq_len:, :, :] # [L, B, V]
+                
+                # Reshape for loss calculation: [B, L, V]
+                noisy_logits = noisy_logits.transpose(0, 1).contiguous()
+                clean_logits = clean_logits.transpose(0, 1).contiguous()
+                
+                # 1. Diffusion Loss on noisy part
+                # Labels are the original tokens (label_ids)
+                # We only compute loss on masked positions
+                diff_loss = sharded_cross_entropy(
+                    noisy_logits.transpose(0, 1), # [L, B, V]
+                    label_ids.transpose(0, 1).contiguous(),
+                    group=self.tp_pg,
+                    dtype=torch.float
+                ).transpose(0, 1) # [B, L]
+                
+                masked_diff_loss = (diff_loss * mask_positions).sum() / (mask_positions.sum() + 1e-5)
+                
+                # Weight by noise level (simple reweighting)
+                # noise_weights is [B, L]
+                weighted_diff_loss = (diff_loss * mask_positions * noise_weights).sum() / (mask_positions.sum() + 1e-5)
+                
+                # 2. Reconstruction Loss on clean part (AR loss or just consistency?)
+                # For now, let's just use diffusion loss
+                loss = weighted_diff_loss
+                return {"loss": loss}
+                
+            elif mode == 1: # Vanilla Diffusion
+                 # Slice to align targets: we need to check if the TARGET (next token) was masked.
+                 # Input: x_0, ..., x_{S-1}. Labels: x_1, ..., x_S.
+                 # Mask positions corresponds to Input (x_0...x_{S-1}).
+                 # We want to know if x_1...x_S were masked.
+                 # We have mask status for x_1...x_{S-1} (from mask_positions[1:]).
+                 # We DO NOT have mask status for x_S (it wasn't in input).
+                 # So we must drop the last prediction step.
+                 
+                 # sharded_logits is [L, B, V], slice to [L-1, B, V] for predicting x_1...x_{S-1}
+                 logits_sliced = sharded_logits[:-1, :, :]
+                 labels_sliced = label_ids[:, :-1]         # x_1...x_{S-1}
+                 mask_sliced = mask_positions[:, 1:]       # Mask status of x_1...x_{S-1}
+                 
+                 loss = sharded_cross_entropy(
+                    logits_sliced,
+                    labels_sliced.transpose(0, 1).contiguous(),
+                    group=self.tp_pg,
+                    dtype=torch.float
+                 ).transpose(0, 1) # [B, S-1]
+
+                 mask = mask_sliced.float().type_as(loss)
+                 dsigma = noise_weights # [B]
+                 
+                 loss_per_token = loss * mask
+                 if dsigma.dim() == 1:
+                     dsigma = dsigma.unsqueeze(1)
+                 
+                 # Formula: (dsigma[:, None] * loss).sum() / loss_mask.sum() - matches DiffuLLaMA
+                 loss_weighted = (loss_per_token.sum(dim=1) * dsigma.squeeze()).sum()
+                 
+                 total_masked = mask.sum()
+                 if total_masked > 0:
+                     loss_val = loss_weighted / total_masked
+                 else:
+                     loss_val = torch.tensor(0.0, device=loss.device, requires_grad=True)
+                 return {"loss": loss_val}
+
+
         loss = sharded_cross_entropy(
             sharded_logits,
             label_ids.transpose(0, 1).contiguous(),
@@ -1049,6 +1408,10 @@ class LlamaForTraining(NanotronModel):
                 "sharded_logits",
                 "label_ids",
                 "label_mask",
+                "mask_positions", 
+                "noise_weights", 
+                "doc_ids", 
+                "diffusion_mode"
             },
             module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
         )
@@ -1064,7 +1427,7 @@ class LlamaForTraining(NanotronModel):
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
-        sharded_logits = self.model(
+        sharded_logits, _, diffusion_mode, mask_positions, noise_weights, doc_ids = self.model.forward_with_hidden_states(
             input_ids=input_ids,
             input_mask=input_mask,
         )
@@ -1072,6 +1435,10 @@ class LlamaForTraining(NanotronModel):
             sharded_logits=sharded_logits,
             label_ids=label_ids,
             label_mask=label_mask,
+            mask_positions=mask_positions,
+            noise_weights=noise_weights,
+            doc_ids=doc_ids,
+            diffusion_mode=diffusion_mode,
         )
         if self.config.z_loss_enabled:
             return {"loss": loss["loss"], "z_loss": loss["z_loss"]}

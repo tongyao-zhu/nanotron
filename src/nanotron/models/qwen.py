@@ -1,5 +1,5 @@
 from typing import Dict, List, Optional, Tuple, Union
-
+import os
 import torch
 from flash_attn.modules.mha import flash_attn_varlen_kvpacked_func
 from torch import nn
@@ -8,7 +8,13 @@ from torch.utils.checkpoint import CheckpointFunction
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import Config, ParallelismArgs
-from nanotron.config.models_config import Qwen2Config, RandomInit, SpectralMupInit
+from nanotron.config.models_config import Qwen2Config, RandomInit, SpectralMupInit, DiffusionArgs
+from nanotron.block_diffusion import (
+    calculate_block_ids,
+    apply_block_masking,
+    create_block_diffusion_attention_mask,
+    transition
+)
 from nanotron.logging import log_rank
 from nanotron.models import NanotronModel
 from nanotron.nn.activations import ACT2FN
@@ -33,6 +39,10 @@ from nanotron.logging import LogMixin
 from nanotron.nn.llama3_ring_attention import llama3_flash_attn_varlen_kvpacked_func, llama3_flash_attn_prepare_cu_seqlens
 logger = logging.get_logger(__name__)
 
+DEBUG = False
+if os.environ.get("DEBUG", "false") == "true":
+    DEBUG = True
+    print("DEBUG mode enabled")
 
 class CoreAttention(nn.Module):
     """Core attention module that can use different attention implementations"""
@@ -223,6 +233,7 @@ class Qwen2Attention(LogMixin, nn.Module):
         hidden_states: torch.Tensor,  # [batch_size*seq_length, hidden_size]
         position_ids: torch.Tensor,  # [batch_size, seq_length] where -1 is padding
         cu_seqlens: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,  # Added cu_seqlens argument
+        diffusion_mode: Optional[torch.Tensor] = None,
     ):
         # [0, 1, 2, 3, 4, 0, 1, 2, -1, -1, -1] # 2 documents with 5 and 3 tokens then padding
         # [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] # 1 document with 11 tokens
@@ -234,9 +245,14 @@ class Qwen2Attention(LogMixin, nn.Module):
         position_ids = position_ids.view(-1)  # [batch_size*seq_length]
 
         qkv = self.qkv_proj(hidden_states)
+        
+        causal = True
+        if diffusion_mode is not None and diffusion_mode.item() == 1:
+             # Vanilla diffusion uses bidirectional attention
+             causal = False
 
         if self._use_qkv_packed:
-            attn_output = self._forward_packed(qkv, seq_length, position_ids, cu_seqlens)
+            attn_output = self._forward_packed(qkv, seq_length, position_ids, cu_seqlens, causal=causal)
         # else:
         #     q, k, v = qkv.split(
         #         [self.local_q_size, self.local_kv_size, self.local_kv_size], dim=-1
@@ -263,7 +279,7 @@ class Qwen2Attention(LogMixin, nn.Module):
         # Return original position_ids shape
         return {"hidden_states": output, "position_ids": position_ids.view(-1, seq_length)}
 
-    def _forward_packed(self, qkv, seq_length, position_ids, cu_seqlens):
+    def _forward_packed(self, qkv, seq_length, position_ids, cu_seqlens, causal=True):
         assert cu_seqlens is not None, "cu_seqlens must be provided for packed attention"
         q = qkv[..., : self.local_num_heads * self.head_dim]  # Not contiguous, similar to flash_attn
         kv = qkv[..., self.local_num_heads * self.head_dim :]  # Not contiguous, similar to flash_attn
@@ -295,7 +311,7 @@ class Qwen2Attention(LogMixin, nn.Module):
                 local_k_slice=cu_seqlens["local_k_slice"],
                 dropout_p=0.0,
                 softmax_scale=None,
-                causal=True,
+                causal=causal,
                 alibi_slopes=None,
                 window_size=(self.sliding_window_size - 1, 0) if self.sliding_window_size is not None else (-1, -1),
                 deterministic=False,
@@ -315,7 +331,7 @@ class Qwen2Attention(LogMixin, nn.Module):
                 max_seqlen,
                 0.0,
                 softmax_scale=None,
-                causal=True,
+                causal=causal,
                 alibi_slopes=None,
                 window_size=(self.sliding_window_size - 1, 0) if self.sliding_window_size is not None else (-1, -1),
                 deterministic=False,
@@ -616,11 +632,12 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: Union[torch.Tensor, TensorPointer],  # [batch_size*seq_length, hidden_size]
         position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
         cu_seqlens: Union[torch.Tensor, TensorPointer],
+        diffusion_mode: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ) -> List[Union[torch.Tensor, TensorPointer]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        output = self.attn(hidden_states=hidden_states, position_ids=position_ids, cu_seqlens=cu_seqlens)
+        output = self.attn(hidden_states=hidden_states, position_ids=position_ids, cu_seqlens=cu_seqlens, diffusion_mode=diffusion_mode)
         hidden_states = output["hidden_states"]
         hidden_states = hidden_states + residual
 
@@ -629,33 +646,36 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states=hidden_states)["hidden_states"]
         hidden_states = hidden_states + residual
 
-        return hidden_states, position_ids, cu_seqlens
+        return hidden_states, position_ids, cu_seqlens, diffusion_mode
 
     def _checkpointed_forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         cu_seqlens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return CheckpointFunction.apply(self._core_forward, True, hidden_states, position_ids, cu_seqlens)
+        diffusion_mode: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        return CheckpointFunction.apply(self._core_forward, True, hidden_states, position_ids, cu_seqlens, diffusion_mode)
 
     def forward(
         self,
         hidden_states: Union[torch.Tensor, TensorPointer],
         position_ids: Union[torch.Tensor, TensorPointer],
         cu_seqlens: Union[torch.Tensor, TensorPointer],
+        diffusion_mode: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         if self.recompute_layer and not isinstance(hidden_states, TensorPointer):
-            hidden_states, position_ids, cu_seqlens = self._checkpointed_forward(
-                hidden_states, position_ids, cu_seqlens
+            hidden_states, position_ids, cu_seqlens, diffusion_mode = self._checkpointed_forward(
+                hidden_states, position_ids, cu_seqlens, diffusion_mode
             )
         else:
-            hidden_states, position_ids, cu_seqlens = self._core_forward(hidden_states, position_ids, cu_seqlens)
+            hidden_states, position_ids, cu_seqlens, diffusion_mode = self._core_forward(hidden_states, position_ids, cu_seqlens, diffusion_mode)
 
         return {
             "hidden_states": hidden_states,
             "position_ids": position_ids,
             "cu_seqlens": cu_seqlens,
+            "diffusion_mode": diffusion_mode,
         }
 
 
@@ -677,6 +697,107 @@ class Embedding(nn.Module):
         return {"input_embeds": input_embeds, "position_ids": position_ids}
 
 
+class DiffusionModule(nn.Module):
+    def __init__(self, config: Qwen2Config):
+        super().__init__()
+        self.config = config
+
+    def forward(self, input_ids: torch.Tensor, input_mask: torch.Tensor):
+        device = input_ids.device
+        
+        # Default outputs (dummies for P2P)
+        noisy_input_ids = input_ids
+        input_mask_updated = input_mask
+        position_ids = torch.empty(0, device=device)
+        mask_positions = torch.empty(0, device=device)
+        noise_weights = torch.empty(0, device=device)
+        doc_ids = torch.empty(0, device=device)
+        diffusion_mode = torch.tensor(0, dtype=torch.int, device=device)
+
+        if self.config.diffusion_config is not None:
+            diff_config = self.config.diffusion_config
+            batch_size, seq_len = input_ids.shape
+            
+            # Debug: Check for diffusion trigger
+            # if torch.distributed.get_rank() == 0:
+            #     print(f"DEBUG: DiffusionModule (Qwen) - config present. Diffusion: {diff_config.diffusion}, Block: {diff_config.block_diffusion}")
+
+            if diff_config.block_diffusion:
+                diffusion_mode = torch.tensor(2, dtype=torch.int, device=device)
+                
+                block_size = diff_config.block_size
+                mask_token_id = diff_config.mask_token_id
+                t_lower = diff_config.t_lower
+                t_upper = diff_config.t_upper
+                bos_token_id = self.config.bos_token_id
+                eos_token_id = self.config.eos_token_id
+                
+                # 1. Calculate block IDs
+                block_ids, pos_ids, d_ids = calculate_block_ids(
+                    input_ids, block_size, bos_token_id, eos_token_id
+                )
+                doc_ids = d_ids
+                
+                # 2. Apply block-wise masking
+                masked_input, mask_pos, t_per_position = apply_block_masking(
+                    input_ids, block_ids, t_lower, t_upper, mask_token_id, is_training=True
+                )
+                mask_positions = mask_pos
+                
+                # 3. Concatenate [noisy, clean]
+                noisy_input_ids = torch.cat([masked_input, input_ids], dim=1)
+                input_mask_updated = torch.cat([input_mask, input_mask], dim=1)
+                
+                # 4. Position IDs for RoPE (repeated)
+                position_ids = torch.cat([pos_ids, pos_ids], dim=1)
+                
+                # 5. Noise weights
+                noise_weights = 1.0 / (t_per_position + 1e-3)
+                
+            elif diff_config.diffusion:
+                diffusion_mode = torch.tensor(1, dtype=torch.int, device=device)
+                
+                mask_token_id = diff_config.mask_token_id
+                sampling_eps = diff_config.sampling_eps
+                maskable_mask = input_mask.bool()
+                
+                # Sample noise level until we get at least one masked token
+                # This prevents missing gradients for the token embedding layer
+                max_attempts = 100
+                for attempt in range(max_attempts):
+                    t = (1 - sampling_eps) * torch.rand(batch_size, device=device) + sampling_eps
+                    noisy_input_ids = transition(input_ids, t[:, None], maskable_mask, mask_token_id)
+                    mask_positions = (noisy_input_ids == mask_token_id).long()
+                    
+                    # Check if we have at least one masked token
+                    if mask_positions.sum().item() > 0:
+                        break
+                    
+                    # Safety: if we've tried many times and still no mask, force higher noise
+                    if attempt == max_attempts - 1:
+                        t = torch.full((batch_size,), 0.5, device=device)
+                        noisy_input_ids = transition(input_ids, t[:, None], maskable_mask, mask_token_id)
+                        mask_positions = (noisy_input_ids == mask_token_id).long()
+                
+                noise_weights = torch.reciprocal(t)
+                
+                # Debug: Check masking
+                # if torch.distributed.get_rank() == 0:
+                #      num_masked = mask_positions.sum().item()
+                #      total_tokens = mask_positions.numel()
+                #      print(f"DEBUG: Diffusion active (Qwen). Masked tokens: {num_masked}/{total_tokens} ({num_masked/total_tokens:.2%})")
+
+        return {
+            "noisy_input_ids": noisy_input_ids,
+            "input_mask_updated": input_mask_updated,
+            "position_ids": position_ids,
+            "mask_positions": mask_positions,
+            "noise_weights": noise_weights,
+            "doc_ids": doc_ids,
+            "diffusion_mode": diffusion_mode
+        }
+
+
 class Qwen2Model(nn.Module):
     """Build pipeline graph for Qwen2 model"""
 
@@ -696,6 +817,22 @@ class Qwen2Model(nn.Module):
         self.tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
         tp_linear_async_communication = (
             parallel_config.tp_linear_async_communication if parallel_config is not None else False
+        )
+
+        self.diffusion_block = PipelineBlock(
+            p2p=self.p2p,
+            module_builder=DiffusionModule,
+            module_kwargs={"config": config},
+            module_input_keys={"input_ids", "input_mask"},
+            module_output_keys={
+                "noisy_input_ids", 
+                "input_mask_updated", 
+                "position_ids", 
+                "mask_positions", 
+                "noise_weights", 
+                "doc_ids", 
+                "diffusion_mode"
+            },
         )
 
         self.token_position_embeddings = PipelineBlock(
@@ -723,8 +860,8 @@ class Qwen2Model(nn.Module):
                         "cp_pg": parallel_context.cp_pg,
                         "layer_idx": layer_idx,
                     },
-                    module_input_keys={"hidden_states", "position_ids", "cu_seqlens"},
-                    module_output_keys={"hidden_states", "position_ids", "cu_seqlens"},
+                    module_input_keys={"hidden_states", "position_ids", "cu_seqlens", "diffusion_mode"},
+                    module_output_keys={"hidden_states", "position_ids", "cu_seqlens", "diffusion_mode"},
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -759,19 +896,132 @@ class Qwen2Model(nn.Module):
         self,
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
+        input_mask: Union[torch.Tensor, TensorPointer] = None,
     ):
-        output = self.token_position_embeddings(input_ids=input_ids, position_ids=position_ids)
+        if input_mask is None:
+            # Create input_mask from position_ids if available and not a pointer
+            if isinstance(position_ids, torch.Tensor):
+                input_mask = (position_ids != -1)
+            else:
+                # If pointer, we assume input_mask will be handled by DiffusionModule (it might fail if None)
+                # But DiffusionModule needs it.
+                # Usually input_ids and position_ids are on rank 0.
+                pass
+        
+        # Debug: Check for EOS/BOS tokens in input_ids
+        if DEBUG and torch.distributed.get_rank() == 0:
+            bos_id = self.config.bos_token_id
+            eos_id = self.config.eos_token_id
+            
+            # Use noisy_input_ids if diffusion active, or input_ids
+            # But we want to check ORIGINAL data for structure
+            check_ids = input_ids
+            if isinstance(check_ids, TensorPointer):
+                # If pointer, we can't check here easily unless we are rank 0 and it's there
+                # Qwen2Model forward receives input_ids.
+                pass
+            elif isinstance(check_ids, torch.Tensor):
+                has_bos = (check_ids == bos_id).any()
+                has_eos = (check_ids == eos_id).any()
+                
+                # Count occurrences
+                num_bos = (check_ids == bos_id).sum().item()
+                num_eos = (check_ids == eos_id).sum().item()
+                
+                print(f"DEBUG: Input Analysis - BOS({bos_id}): {num_bos}, EOS({eos_id}): {num_eos}, Shape: {check_ids.shape}")
+                if num_eos == 0 and num_bos == 0:
+                    print("DEBUG: WARNING - No BOS/EOS found in batch! Documents might be merged or truncated.")
+                
+                # Also print first few tokens
+                # print(f"DEBUG: First 20 tokens: {check_ids[0, :20].tolist()}")
+
+        diff_output = self.diffusion_block(input_ids=input_ids, input_mask=input_mask)
+        noisy_input_ids = diff_output["noisy_input_ids"]
+        
+        # Use noisy_input_ids for embedding
+        # Also, we might need updated position_ids if diffusion (Block Diffusion) changed them?
+        # In Block Diffusion, position_ids are repeated.
+        # DiffusionModule returns "position_ids".
+        
+        # If diffusion is active (mode > 0), use position_ids from diffusion
+        # We can check diffusion_mode. 
+        # But this is pipeline, so we just pass what we got.
+        
+        # However, Qwen embedding layer takes input_ids and position_ids.
+        # And Qwen2Attention uses position_ids.
+        
+        # If diffusion returned non-empty position_ids, we should use them?
+        # The DiffusionModule returns empty position_ids if not in block diffusion.
+        # But for pipeline consistency, we should probably handle this.
+        
+        # Let's rely on what DiffusionModule returns.
+        # If it returns empty position_ids (for vanilla diffusion), we should use the original position_ids?
+        # DiffusionModule in llama.py returns empty tensor if not block diffusion.
+        
+        # Qwen embedding forward:
+        # output = self.token_position_embeddings(input_ids=input_ids, position_ids=position_ids)
+        
+        # We should modify how we call token_position_embeddings.
+        
+        # If diff_output["position_ids"] is not empty, use it. 
+        # But how to check if it's not empty across pipeline?
+        # We can pass both and let Embedding/Model decide? 
+        
+        # Simpler approach: 
+        # Update Embedding to accept "diffusion_position_ids" etc? No.
+        
+        # Let's assume for Vanilla Diffusion, we use original position_ids.
+        # For Block Diffusion, we use new position_ids.
+        
+        # In Llama implementation:
+        # position_ids = diff_output["position_ids"]
+        # ... 
+        # But Llama Embedding doesn't take position_ids in forward! It only does token embedding.
+        # Qwen Embedding takes position_ids and returns them.
+        
+        # Qwen Embedding:
+        # def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):
+        #    return {"input_embeds": input_embeds, "position_ids": position_ids}
+        
+        # So it effectively just passes position_ids through.
+        
+        # So we can just pass the correct position_ids to token_position_embeddings.
+        
+        # But we need to know if we should use diff_output["position_ids"] or original.
+        # We can check if config.diffusion_config.block_diffusion is True.
+        
+        target_position_ids = position_ids
+        if self.config.diffusion_config is not None and self.config.diffusion_config.block_diffusion:
+             target_position_ids = diff_output["position_ids"]
+             
+        output = self.token_position_embeddings(input_ids=noisy_input_ids, position_ids=target_position_ids)
+        
         # Compute cu_seqlens
+        # ... (same logic as before but using output["position_ids"])
+        position_ids = output["position_ids"]
+        
         cu_seqlens: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None
-        if position_ids.numel() > 0:
-            start_indices = torch.where(position_ids.view(-1) == 0)[0]
-            cu_seqlens = torch.cat(
-                [start_indices, torch.tensor([position_ids.numel()], dtype=torch.int32, device=start_indices.device)]
-            ).to(torch.int32)
+        if isinstance(position_ids, torch.Tensor) and position_ids.numel() > 0:
+            # Debug: Check position_ids pattern
+            if DEBUG and torch.distributed.get_rank() == 0 : 
+                print(f"DEBUG: position_ids sample: {position_ids.view(-1)[:20].tolist()}...")
+                
+            pos_flat = position_ids.view(-1)
+            # Robust cu_seqlens: start at 0 or when position resets (<= previous), always include final length
+            starts = torch.zeros_like(pos_flat, dtype=torch.bool)
+            starts[0] = True
+            starts[1:] = pos_flat[1:] <= pos_flat[:-1]
+            start_indices = torch.nonzero(starts).squeeze(-1).to(torch.int32)
+            cu_seqlens = torch.cat([start_indices, torch.tensor([pos_flat.numel()], dtype=torch.int32, device=pos_flat.device)], dim=0)
+            
+            # Debug: Check cu_seqlens
+            if DEBUG and torch.distributed.get_rank() == 0:
+                print(f"DEBUG: cu_seqlens: {cu_seqlens.tolist()} (Num segments: {len(cu_seqlens)-1})")
+
 
             # llama3 ring attention
             if self.config._attn_implementation == "llama3_ring_attention":
-                local_sequence_length = input_ids.shape[1]
+                local_sequence_length = noisy_input_ids.shape[1] # use noisy_input_ids shape
                 sequence_length = position_ids.shape[1]
                 assert sequence_length == local_sequence_length * self.parallel_context.cp_pg.size(), f"sequence_length={sequence_length} must be equal to local_sequence_length={local_sequence_length} * cp_pg.size()={self.parallel_context.cp_pg.size()}"
                 assert sequence_length % (2 * self.parallel_context.cp_pg.size()) == 0, f"Sequence length {sequence_length} must be divisible by {2 * self.parallel_context.cp_pg.size()} when using llama3 ring attention"
@@ -794,11 +1044,17 @@ class Qwen2Model(nn.Module):
                     "max_seqlen_k": max_seqlen_k,
                     "local_k_slice": local_k_slice,
                 }
-
+        
+        # We need to pass diffusion info to decoder layers if they need it (e.g. for attention masking in block diffusion)
+        # Qwen2Attention doesn't handle diffusion_mode yet. 
+        # But for Vanilla Diffusion, it's just masking input.
+        # So we don't strictly need to pass diffusion_mode to decoder layers for Vanilla.
+        
         decoder_states = {
             "hidden_states": output["input_embeds"],
             "position_ids": output["position_ids"],
             "cu_seqlens": cu_seqlens,
+            "diffusion_mode": diff_output["diffusion_mode"],
         }
 
         for decoder_layer in self.decoder:
@@ -808,7 +1064,8 @@ class Qwen2Model(nn.Module):
 
         sharded_logits = self.lm_head(x=hidden_states)["logits"]
 
-        return sharded_logits
+        return sharded_logits, diff_output["diffusion_mode"], diff_output["mask_positions"], diff_output["noise_weights"], diff_output["doc_ids"]
+
 
     def get_block_compute_costs(self):
         """Computes the compute cost of each block in the model for load balancing."""
@@ -866,9 +1123,65 @@ class Loss(nn.Module):
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        mask_positions: Optional[torch.Tensor] = None,
+        noise_weights: Optional[torch.Tensor] = None,
+        doc_ids: Optional[torch.Tensor] = None,
+        diffusion_mode: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
-        loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
+        
+        if diffusion_mode is not None and diffusion_mode.item() > 0:
+            mode = diffusion_mode.item()
+            loss = sharded_cross_entropy(
+                sharded_logits.transpose(0, 1), # [L, B, V] -> [B, L, V] ... wait, sharded_cross_entropy takes [L, B, V]
+                label_ids.transpose(0, 1).contiguous(),
+                group=self.tp_pg,
+                dtype=torch.float
+            ).transpose(0, 1) # [B, L]
+
+            if mode == 2: # Block Diffusion
+                 # Not implemented for Qwen yet (requires splitting logits etc)
+                 pass
+            elif mode == 1: # Vanilla Diffusion
+                 # Slice to align targets: we need to check if the TARGET (next token) was masked.
+                 # Input: x_0, ..., x_{S-1}. Labels: x_1, ..., x_S.
+                 # Mask positions corresponds to Input (x_0...x_{S-1}).
+                 # We want to know if x_1...x_S were masked.
+                 # We have mask status for x_1...x_{S-1} (from mask_positions[1:]).
+                 # We DO NOT have mask status for x_S (it wasn't in input).
+                 # So we must drop the last prediction step.
+                 
+                 logits_sliced = sharded_logits[:, :-1, :] # Predicts x_1...x_{S-1}
+                 labels_sliced = label_ids[:, :-1]         # x_1...x_{S-1}
+                 mask_sliced = mask_positions[:, 1:]       # Mask status of x_1...x_{S-1}
+                 
+                 loss = sharded_cross_entropy(
+                    logits_sliced.transpose(0, 1),
+                    labels_sliced.transpose(0, 1).contiguous(),
+                    group=self.tp_pg,
+                    dtype=torch.float
+                 ).transpose(0, 1) # [B, S-1]
+
+                 mask = mask_sliced.float().type_as(loss)
+                 dsigma = noise_weights # [B]
+                 
+                 loss_per_token = loss * mask
+                 if dsigma.dim() == 1:
+                     dsigma = dsigma.unsqueeze(1)
+                 # ensure taht disgma is not a single number 
+                 if dsigma.dim() == 0:
+                    raise ValueError("dsigma must be a tensor, not a single number")
+                 
+                 loss_weighted = (loss_per_token.sum(dim=1) * dsigma.squeeze()).sum()
+                 
+                 total_masked = mask.sum()
+                 if total_masked > 0:
+                     loss_val = loss_weighted / total_masked
+                 else:
+                     loss_val = torch.tensor(0.0, device=loss.device, requires_grad=True)
+                 return {"loss": loss_val}
+        
+        loss = sharded_cross_entropy(sharded_logits.transpose(0, 1), label_ids.transpose(0, 1).contiguous(), group=self.tp_pg, dtype=torch.float).transpose(0, 1)
         loss = masked_mean(loss, label_mask, dtype=torch.float)
         return {"loss": loss}
 
@@ -919,6 +1232,10 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                 "sharded_logits",
                 "label_ids",
                 "label_mask",
+                "mask_positions", 
+                "noise_weights", 
+                "doc_ids", 
+                "diffusion_mode"
             },
             module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
         )
@@ -932,15 +1249,21 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         position_ids: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        input_mask: Union[torch.Tensor, TensorPointer] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
-        sharded_logits = self.model(
+        sharded_logits, diffusion_mode, mask_positions, noise_weights, doc_ids = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
+            input_mask=input_mask,
         )
         loss = self.loss(
             sharded_logits=sharded_logits,
             label_ids=label_ids,
             label_mask=label_mask,
+            mask_positions=mask_positions,
+            noise_weights=noise_weights,
+            doc_ids=doc_ids,
+            diffusion_mode=diffusion_mode,
         )
         if self.config.z_loss_enabled:
             return {"loss": loss["loss"], "z_loss": loss["z_loss"]}

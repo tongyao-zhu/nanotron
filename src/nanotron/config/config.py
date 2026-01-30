@@ -639,7 +639,7 @@ def get_config_from_dict(
         data_class=config_class,
         data=config_dict,
         config=dacite.Config(
-            cast=[Path],
+            cast=[Path, float, int],
             type_hooks={
                 torch.dtype: cast_str_to_torch_dtype,
                 PipelineEngine: cast_str_to_pipeline_engine,
