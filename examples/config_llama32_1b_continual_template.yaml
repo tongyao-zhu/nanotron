@@ -95,7 +95,7 @@ optimizer:
     lr_warmup_style: linear
     lr_decay_style: linear
     lr_decay_steps: null
-    lr_decay_starting_step: 12500  
+    lr_decay_starting_step: 25000  
     min_decay_lr: 5.0e-05
   zero_stage: ${ZERO_STAGE}
 
@@ -122,7 +122,7 @@ tokens:
   sequence_length: ${SEQUENCE_LENGTH}
   micro_batch_size: ${MICRO_BATCH_SIZE}
   batch_accumulation_per_replica: ${BATCH_ACCUM}
-  train_steps: 12500
+  train_steps: 25000
   val_check_interval: -1
   limit_val_batches: 0
   limit_test_batches: 0
