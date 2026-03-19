@@ -4,13 +4,14 @@ cd /home/aiops/zhuty/nanotron
 
 base_path=$1
 delete_old=$2
+device=${3:-cuda}  # Default to cuda if not specified
 
 for sub_path in $base_path/*; do
     if [ -d "$sub_path" ]; then
         dir_name=$(basename "$sub_path")
         if [[ "$dir_name" =~ ^[0-9]+$ ]]; then
-            echo "Converting $sub_path"
-            bash /home/aiops/zhuty/nanotron/convert_to_hf.sh $sub_path
+            echo "Converting $sub_path using device: $device"
+            bash /home/aiops/zhuty/nanotron/convert_to_hf.sh $sub_path $device
         else
             echo "Skipping $sub_path"
         fi
