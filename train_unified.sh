@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Usage: ./train_unified.sh <DATASET_NAME> [MODEL_SIZE] [NNODES] [ADDITIONAL_ARGS]
-# Example: ./train_unified.sh my_dataset 1b 4 "--zero1 --length 2k --lr 1e-4"
+# Usage: ./train_unified.sh <DATASET_NAME> [MODEL_SIZE] [ADDITIONAL_ARGS]
+# Example: ./train_unified.sh my_dataset 1b "--zero1 --length 2k --lr 1e-4"
+# Example: ./train_unified.sh my_dataset 3b "--zero1 --length 2k --lr 1e-4"
 
 DATASET_NAME=$1
 MODEL_SIZE=${2:-1b}
@@ -9,7 +10,7 @@ ADDITIONAL_ARGS=${3:-}
 
 if [ -z "$DATASET_NAME" ]; then
     echo "Error: Dataset name is required."
-    echo "Usage: $0 <DATASET_NAME> [MODEL_SIZE] [NNODES] [ADDITIONAL_ARGS]"
+    echo "Usage: $0 <DATASET_NAME> [MODEL_SIZE] [ADDITIONAL_ARGS]"
     exit 1
 fi
 
@@ -70,15 +71,8 @@ export MICRO_BATCH_SIZE=1
 echo "Sequence Length: $SEQUENCE_LENGTH (${SEQ_LENGTH_ARG})"
 echo "Scaling Factor: $SCALING_FACTOR"
 
-# 1. Calculate DP and Batch Accumulation to maintain Global Batch Size = 512
-# Global BS (512) = DP * Micro_Batch * Accumulation
+# 1. Initial setup for parallelism calculation
 GPUS_PER_NODE=8
-export DP=$(($NNODES * $GPUS_PER_NODE))
-export BATCH_ACCUM=$((512 / $DP * $SCALING_FACTOR))
-
-echo "Calculated Configuration:"
-echo "  DP Size: $DP ($NNODES x $GPUS_PER_NODE)"
-echo "  Batch Accumulation: $BATCH_ACCUM"
 
 # 2. Handle Additional Args and Suffix
 SUFFIX="${DATASET_NAME}"
@@ -94,6 +88,26 @@ export ZERO_STAGE=0
 export ACCUMULATE_GRAD_IN_FP32=true
 export IS_SCRATCH=false
 export LEARNING_RATE=5.0e-05  # default learning rate
+export USE_QKV_PACKED=true
+export SHIFT=false
+export TP=1  # default tensor parallelism
+# Parse Tensor Parallelism FIRST (needed for DP calculation)
+if [[ "$ADDITIONAL_ARGS" =~ --tp[[:space:]]+([0-9]+) ]]; then
+    export TP="${BASH_REMATCH[1]}"
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+    echo "  Tensor Parallelism: $TP"
+fi
+
+# Recalculate DP based on TP
+TOTAL_GPUS=$(($NNODES * $GPUS_PER_NODE))
+export DP=$(($TOTAL_GPUS / $TP))
+export BATCH_ACCUM=$((512 / $DP * $SCALING_FACTOR))
+
+echo "Final Parallelism Configuration:"
+echo "  Total GPUs: $TOTAL_GPUS"
+echo "  TP: $TP"
+echo "  DP: $DP"
+echo "  Batch Accumulation: $BATCH_ACCUM"
 
 # Parse Additional Args
 if [[ "$ADDITIONAL_ARGS" == *"--diffusion"* ]]; then
@@ -107,6 +121,8 @@ fi
 if [[ "$ADDITIONAL_ARGS" =~ --block-size[[:space:]]+([0-9]+) ]]; then
     export BLOCK_SIZE="${BASH_REMATCH[1]}"
     export IS_BLOCK_DIFFUSION=true
+    export USE_QKV_PACKED=true
+    echo "  Mode: Block Diffusion (Size: $BLOCK_SIZE), USE_QKV_PACKED: $USE_QKV_PACKED"
     # Ensure Mask Token is set if not already (implies diffusion mode usually)
     if [ "$MASK_TOKEN_ID" -eq -1 ]; then
         export MASK_TOKEN_ID=128255
@@ -129,9 +145,66 @@ fi
 
 if [[ "$ADDITIONAL_ARGS" == *"--zero1"* ]]; then
     export ZERO_STAGE=1
-    export ACCUMULATE_GRAD_IN_FP32=false
+    export ACCUMULATE_GRAD_IN_FP32=true
     SUFFIX="${SUFFIX}_zero1"
     echo "  Mode: Zero1"
+fi
+
+if [[ "$ADDITIONAL_ARGS" == *"--shift"* ]]; then
+    export SHIFT=true
+    SUFFIX="${SUFFIX}_shift"
+    echo "  Mode: Autoregressive Shift (only predict masked tokens)"
+fi
+
+# Add TP to suffix if not default
+if [ "$TP" -gt 1 ]; then
+    SUFFIX="${SUFFIX}_tp${TP}"
+fi
+
+# Parse --init_ckpt (initialize from a specific nanotron checkpoint)
+INIT_CKPT_PATH=""
+if [[ "$ADDITIONAL_ARGS" =~ --init_ckpt[[:space:]]+([^[:space:]]+) ]]; then
+    INIT_CKPT_PATH="${BASH_REMATCH[1]}"
+    
+    # Check if the checkpoint path ends with _hf (HuggingFace format)
+    if [[ "$INIT_CKPT_PATH" == *_hf ]]; then
+        CONVERTED_PATH="${INIT_CKPT_PATH}_converted"
+        
+        # Check if conversion is needed
+        if [ ! -d "$CONVERTED_PATH" ] || [ -z "$(ls -A "$CONVERTED_PATH" 2>/dev/null)" ]; then
+            echo "================================"
+            echo "HuggingFace checkpoint detected: $INIT_CKPT_PATH"
+            echo "Converting to Nanotron format: $CONVERTED_PATH"
+            echo "================================"
+            
+            # Run conversion
+            torchrun --nproc_per_node=1 examples/llama/convert_hf_to_nanotron.py \
+                --checkpoint_path="$INIT_CKPT_PATH" \
+                --save_path="$CONVERTED_PATH"
+            
+            if [ $? -ne 0 ]; then
+                echo "Error: Failed to convert HuggingFace checkpoint to Nanotron format"
+                exit 1
+            fi
+            
+            echo "Conversion completed successfully!"
+            echo "================================"
+        else
+            echo "  Using existing converted checkpoint: $CONVERTED_PATH"
+        fi
+        
+        # Use the converted path
+        INIT_CKPT_PATH="$CONVERTED_PATH"
+    fi
+    
+    # Derive suffix from last two path components, removing "checkpoints-" prefix
+    INIT_CKPT_PARENT=$(basename "$(dirname "$INIT_CKPT_PATH")")
+    INIT_CKPT_STEP=$(basename "$INIT_CKPT_PATH")
+    INIT_CKPT_SUFFIX="${INIT_CKPT_PARENT}_${INIT_CKPT_STEP}"
+    INIT_CKPT_SUFFIX="${INIT_CKPT_SUFFIX#checkpoints-}"  # Remove "checkpoints-" prefix
+    SUFFIX="${SUFFIX}_from_${INIT_CKPT_SUFFIX}"
+    echo "  Init Checkpoint: $INIT_CKPT_PATH"
+    echo "  Init Checkpoint Suffix: $INIT_CKPT_SUFFIX"
 fi
 
 # Parse Learning Rate
@@ -162,17 +235,43 @@ echo "Run Suffix: $SUFFIX"
 
 
 
-# 3. Setup Config and Data
-CONFIG_FILE="examples/config_llama32_1b_continual_template.yaml"
+# 3. Setup Config and Data based on Model Size
+case "$MODEL_SIZE" in
+    1b)
+        CONFIG_FILE="examples/config_llama32_1b_continual_template.yaml"
+        DEFAULT_CHECKPOINT="/home/aiops/zhuty/nanotron/checkpoints/llama32-1b-nt"
+        DEFAULT_MAX_STEP=25000
+        ;;
+    3b)
+        CONFIG_FILE="examples/config_llama32_3b_continual_template.yaml"
+        DEFAULT_CHECKPOINT="/home/aiops/zhuty/nanotron/checkpoints/llama32-3b-nt"
+        DEFAULT_MAX_STEP=12500
+        ;;
+    *)
+        echo "Error: Invalid model size '$MODEL_SIZE'. Must be one of: 1b, 3b"
+        exit 1
+        ;;
+esac
+
+# Allow override via environment variable, otherwise use model-specific default
+if [ -z "$MAX_STEP" ]; then
+    export MAX_STEP=$DEFAULT_MAX_STEP
+fi
+echo "Max Training Steps: $MAX_STEP"
+
 DATASET_FOLDER="/home/aiops/zhuty/cont_data/${DATASET_NAME}/llama_tokenized"
 
 # if from scratch set the key and value
 if [ "$IS_SCRATCH" = true ]; then
     export INIT_KEY="std"
     export INIT_VALUE=0.025
+elif [ -n "$INIT_CKPT_PATH" ]; then
+    export INIT_KEY="path"
+    export INIT_VALUE="$INIT_CKPT_PATH"
+    echo "  Initializing from checkpoint: $INIT_CKPT_PATH"
 else
     export INIT_KEY="path"
-    export INIT_VALUE="/home/aiops/zhuty/nanotron/checkpoints/llama32-1b-nt"
+    export INIT_VALUE="$DEFAULT_CHECKPOINT"
 fi
 
 
@@ -189,14 +288,53 @@ fi
 # 4. Distributed Setup
 TORCHRUN_ARGS="--nproc_per_node=$GPUS_PER_NODE"
 
+# Allow override via environment variable, otherwise use defaults
+if [ -z "$CHECKPOINT_INTERVAL" ]; then
+    export CHECKPOINT_INTERVAL=500
+    
+    if [ "$NNODES" -gt 1 ]; then
+        # SCALE UP the checkpoint interval for multi-node
+        export CHECKPOINT_INTERVAL=$((500 * $NNODES))
+    fi
+fi
+
+echo "  Checkpoint Interval: $CHECKPOINT_INTERVAL"
+
 if [ "$NNODES" -gt 1 ]; then
     echo "--------------------------------"
     echo "Setting up Multi-Node Environment"
-    
+
     # Assume existing env vars or set defaults
     : "${MASTER_ADDR:=localhost}"
     : "${MASTER_PORT:=29500}"
     : "${RANK:=0}"
+
+    # Set NCCL network interface if not already set
+    if [ -z "$NCCL_SOCKET_IFNAME" ]; then
+        # Auto-detect the network interface for inter-node communication
+        # Try common interface names in order of preference
+        if ip link show eth0 &>/dev/null; then
+            export NCCL_SOCKET_IFNAME=eth0
+            echo "  Auto-detected network interface: eth0"
+        elif ip link show ib0 &>/dev/null; then
+            export NCCL_SOCKET_IFNAME=ib0
+            echo "  Auto-detected network interface: ib0"
+        elif ip link show bond0 &>/dev/null; then
+            export NCCL_SOCKET_IFNAME=bond0
+            echo "  Auto-detected network interface: bond0"
+        else
+            echo "  WARNING: Could not auto-detect network interface. NCCL may fail."
+            echo "  Please set NCCL_SOCKET_IFNAME environment variable manually."
+        fi
+    else
+        echo "  Using NCCL_SOCKET_IFNAME: $NCCL_SOCKET_IFNAME"
+    fi
+
+    # Set GLOO interface to match NCCL
+    if [ -n "$NCCL_SOCKET_IFNAME" ]; then
+        export GLOO_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME
+        export TP_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME
+    fi
 
     # Resolve hostname to IP. Only run this in MY
     if [ -f "/home/aiops/zhuty/THIS_IS_MY.txt" ]; then
@@ -238,8 +376,17 @@ if [ "$NNODES" -gt 1 ]; then
         export GLOO_SOCKET_FAMILY=AF_INET
     fi
 
+    # Additional NCCL settings for stability
     export NCCL_DEBUG=INFO
     export TORCH_DISTRIBUTED_DEBUG=DETAIL
+    export NCCL_IB_DISABLE=0  # Enable InfiniBand if available
+    export NCCL_NET_GDR_LEVEL=2  # Enable GPU Direct RDMA
+    export NCCL_ASYNC_ERROR_HANDLING=1  # Better error handling
+    export NCCL_TIMEOUT=1800  # 30 minutes timeout for slow networks
+    
+    # Force IPv4 for all multi-node setups to avoid ambiguity
+    export NCCL_SOCKET_FAMILY=AF_INET
+    export GLOO_SOCKET_FAMILY=AF_INET
 fi
 
 echo "--------------------------------"
