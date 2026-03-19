@@ -212,6 +212,10 @@ class DistributedTrainer:
             optimizer_args=self.config.optimizer,
             parallel_context=self.parallel_context,
         )
+        if (self.grad_accumulator is not None
+            and hasattr(self.model_config, 'diffusion_config') and self.model_config.diffusion_config and self.model_config.diffusion_config.diffusion
+            and hasattr(self.model_config, 'num_hidden_layers') and self.model_config.num_hidden_layers >= 28):
+            self.grad_accumulator.nan_safe_mode = True
         if self.init_checkpoint_path is not None and self.config.checkpoints.load_optimizer:
             load_optimizer(
                 optimizer=self.optimizer,

@@ -116,6 +116,7 @@ class FP32GradientAccumulator(GradientAccumulator):
                 fp32_param.requires_grad = True
 
         self._is_accumulation_sync_step = False
+        self.nan_safe_mode = False
         # We need the last allreduce handle to make sure it finishes before the optimizer step
         self.fp32_grads_allreduce_handle: Optional[torch.futures.Future] = None
 
@@ -138,7 +139,7 @@ class FP32GradientAccumulator(GradientAccumulator):
             assert hasattr(self, "param_name_to_offsets")
             named_offsets = sorted(self.param_name_to_offsets.items(), key=lambda x: x[0])
             flat_grad_buffers = [self.fp32_grad_buffers[name]["fp32_grad"].view(-1) for name, _ in named_offsets]
-            dist.reduce_scatter_coalesced(
+            accumulator.fp32_grads_allreduce_handle = dist.reduce_scatter_coalesced(
                 output_tensor_list=[
                     flat_grad_buffer[start_offset:end_offset]
                     for (_, (start_offset, end_offset)), flat_grad_buffer in zip(named_offsets, flat_grad_buffers)
@@ -219,7 +220,12 @@ class FP32GradientAccumulator(GradientAccumulator):
 
         if self._is_accumulation_sync_step is False:
             # WARNING: We assume fp32_grad_bucket is already zeroed
-            fp32_grad.add_(half_param.grad)
+            if self.nan_safe_mode and (torch.isnan(half_param.grad).any() or torch.isinf(half_param.grad).any()):
+                grad = half_param.grad.clone()
+                grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                fp32_grad.add_(grad)
+            else:
+                fp32_grad.add_(half_param.grad)
             # In case _is_accumulation_sync_step = True: no need to add half gradients, because it's done in the allreduce hook
 
         # TODO @thomasw21: Is it better to set to zero instead?
@@ -352,7 +358,6 @@ def get_fp32_accum_hook(
             return fut
 
         if reduce_scatter:
-            raise NotImplementedError("Not implemented")
             assert hasattr(accumulator, "param_name_to_offsets")
             grad_buffer_tensor_list = [
                 accumulator.get_grad_buffer(param_id_to_name[id(param)]).view(-1) for param in bucket.parameters()
@@ -366,10 +371,10 @@ def get_fp32_accum_hook(
                 for grad_buffer, param in zip(grad_buffer_tensor_list, bucket.parameters())
             ]
             input_tensor_lists = [
-                torch.split(grad_buffer, split_size_or_sections=len(grad_buffer) // dp_pg.size())
+                torch.split(grad_buffer, split_size_or_sections=len(grad_buffer) // dp_cp_pg.size())
                 for grad_buffer in grad_buffer_tensor_list
             ]
-            dist.reduce_scatter_coalesced(
+            accumulator.fp32_grads_allreduce_handle = dist.reduce_scatter_coalesced(
                 output_tensor_list=output_tensor_list,
                 input_tensor_lists=input_tensor_lists,
                 op=reduce_op,
