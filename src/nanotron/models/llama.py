@@ -24,15 +24,18 @@ from flash_attn.flash_attn_interface import (
 from torch import nn
 from torch.utils.checkpoint import CheckpointFunction
 
+# Import FlexAttention for block diffusion
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+FLEX_ATTENTION_AVAILABLE = True
+
+
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import Config, LlamaConfig, ParallelismArgs
 from nanotron.config.models_config import RandomInit, SpectralMupInit, DiffusionArgs
 from nanotron.block_diffusion import (
-    calculate_block_ids,
-    apply_block_masking,
-    create_block_diffusion_attention_mask,
-    transition
+    transition,
+    FLEX_ATTENTION_AVAILABLE
 )
 from nanotron.generation.generate_store import AttachableStore
 from nanotron.logging import log_rank
@@ -272,68 +275,28 @@ class CoreAttention(nn.Module):
     @checkpoint_method(attr_name="checkpoint_attention")
     def forward(
         self,
-        query_states: torch.Tensor,  # [batch_size * q_length, n_local_q_heads, inner_dim]
-        key_states: torch.Tensor,  # [batch_size * kv_length, n_local_kv_heads, inner_dim]
-        value_states: torch.Tensor,  # [batch_size * kv_length, n_local_kv_heads, inner_dim]
-        q_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, q_length] (can be broadcasted to that size)
-        kv_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, kv_length] (can be broadcasted to that size)
-        doc_ids: Optional[torch.Tensor] = None,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        q_sequence_mask: torch.Tensor,
+        kv_sequence_mask: torch.Tensor,
+        block_mask=None,
         diffusion_mode: Optional[torch.Tensor] = None,
     ):
         if diffusion_mode is not None and diffusion_mode.item() == 2:
-            # Block Diffusion path using manual mask creation and SDPA
-            # Inputs are [batch, seq, heads, dim] because CausalSelfAttention didn't flatten them
-            # We need to create the mask here because passing it through pipeline is expensive/complex
+            if not FLEX_ATTENTION_AVAILABLE:
+                raise RuntimeError("FlexAttention not available. Requires PyTorch 2.5+")
             
-            batch_size, seq_len, _, _ = query_states.shape
-            device = query_states.device
+            if block_mask is None:
+                raise RuntimeError("block_mask is None but diffusion_mode=2")
             
-            # We need to reconstruct block_size from somewhere or infer it? 
-            # We can't access config here easily without passing it.
-            # But we can infer noisy_len = seq_len // 2
-            noisy_len = seq_len // 2
-            # Infer block_size from doc_ids?
-            # doc_ids is [batch, seq_len]
-            # Actually, calculate_block_ids returns block_ids. 
-            # We need block_size to recreate the mask. 
-            # Or we can pass `block_attn_mask`? But we decided not to pass large tensors.
-            # Wait, `CoreAttention` has `self.config`? No, `self` is `CoreAttention`.
-            # But `CoreAttention` is initialized with `LlamaConfig`.
+            q = query_states.transpose(1, 2)
+            k = key_states.transpose(1, 2)
+            v = value_states.transpose(1, 2)
             
-            # Use config from initialization
-            # But LlamaConfig doesn't have diffusion_config unless we added it?
-            # Yes, we added it to LlamaConfig.
+            attn_output = flex_attention(q, k, v, block_mask=block_mask)
             
-            if hasattr(self, 'config') and hasattr(self.config, 'diffusion_config') and self.config.diffusion_config is not None:
-                block_size = self.config.diffusion_config.block_size
-                
-                # Recreate mask
-                # Need doc_boundaries_mask
-                doc_boundaries_mask = None
-                if doc_ids is not None and doc_ids.numel() > 0:
-                    doc_boundaries_mask = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1))
-                
-                block_attn_mask = create_block_diffusion_attention_mask(
-                    batch_size=batch_size,
-                    seq_len=seq_len,
-                    block_size=block_size,
-                    noisy_len=noisy_len,
-                    device=device,
-                    doc_boundaries=doc_boundaries_mask
-                )
-                
-                # Permute to [batch, heads, seq, dim] for SDPA
-                q = query_states.permute(0, 2, 1, 3)
-                k = key_states.permute(0, 2, 1, 3)
-                v = value_states.permute(0, 2, 1, 3)
-                
-                # SDPA
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, attn_mask=block_attn_mask, dropout_p=0.0
-                )
-                
-                # Permute back to [batch, seq, heads, dim]
-                return attn_output.permute(0, 2, 1, 3)
+            return attn_output.transpose(1, 2)
 
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
@@ -345,7 +308,11 @@ class CoreAttention(nn.Module):
 
         # TODO(kunhao): flash attn's causal means that the query can only attend to the keys before it. This is not
         # what we want if we are using kv cache. This is a hack as we always have q_length == 1 when using kv cache.
-        causal = False if q_sequence_mask.shape[1] == 1 else True
+        if diffusion_mode is not None and diffusion_mode.item() == 1:
+            causal = False
+            print("DEBUG: FlashAttention - causal=False (diffusion_mode=1)")
+        else:
+            causal = False if q_sequence_mask.shape[1] == 1 else True
 
         # NOTE: this scale is for µTransfer,
         # in SP, we use sqrt(1/d_h)
@@ -504,7 +471,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         position_ids: Optional[torch.Tensor] = None,
         mask_positions: Optional[torch.Tensor] = None,
         noise_weights: Optional[torch.Tensor] = None,
-        doc_ids: Optional[torch.Tensor] = None,
+        block_mask: Optional[torch.Tensor] = None,
         diffusion_mode: Optional[torch.Tensor] = None,
     ):
         qkv_states = self.qkv_proj(
@@ -548,7 +515,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         else:  # Training case
             return self._forward_training(
                 query_states, key_states, value_states, sequence_mask, batch_size, q_length,
-                position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode
+                position_ids, mask_positions, noise_weights, block_mask, diffusion_mode
             )
 
     def _forward_inference(self, query_states, key_states, value_states, sequence_mask, batch_size, q_length, store):
@@ -745,7 +712,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         return {"hidden_states": output, "sequence_mask": sequence_mask}
 
     def _forward_training(self, query_states, key_states, value_states, sequence_mask, batch_size, q_length, 
-                          position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode):
+                          position_ids, mask_positions, noise_weights, block_mask, diffusion_mode):
         # Apply rotary embeddings to query/key states
         key_value_states = torch.cat([key_states.unsqueeze(0), value_states.unsqueeze(0)], dim=0)
         key_value_states = key_value_states.permute(1, 2, 0, 3, 4).contiguous()
@@ -770,7 +737,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 value_states=value_states,
                 q_sequence_mask=q_sequence_mask,
                 kv_sequence_mask=kv_sequence_mask,
-                doc_ids=doc_ids,
+                block_mask=block_mask,
                 diffusion_mode=diffusion_mode
             )
         else:
@@ -830,7 +797,7 @@ class LlamaDecoderLayer(nn.Module):
         position_ids: Union[torch.Tensor, TensorPointer],
         mask_positions: Union[torch.Tensor, TensorPointer],
         noise_weights: Union[torch.Tensor, TensorPointer],
-        doc_ids: Union[torch.Tensor, TensorPointer],
+        block_mask: Union[torch.Tensor, TensorPointer],
         diffusion_mode: Union[torch.Tensor, TensorPointer],
     ) -> List[Union[torch.Tensor, TensorPointer]]:
         residual = hidden_states
@@ -842,7 +809,7 @@ class LlamaDecoderLayer(nn.Module):
             position_ids=position_ids,
             mask_positions=mask_positions,
             noise_weights=noise_weights,
-            doc_ids=doc_ids,
+            block_mask=block_mask,
             diffusion_mode=diffusion_mode
         )
         hidden_states = output["hidden_states"]
@@ -853,7 +820,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states=hidden_states)["hidden_states"]
         hidden_states = hidden_states + residual
 
-        return hidden_states, output["sequence_mask"], position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode
+        return hidden_states, output["sequence_mask"], position_ids, mask_positions, noise_weights, block_mask, diffusion_mode
 
     def _checkpointed_forward(
         self,
@@ -862,10 +829,10 @@ class LlamaDecoderLayer(nn.Module):
         position_ids: torch.Tensor,
         mask_positions: torch.Tensor,
         noise_weights: torch.Tensor,
-        doc_ids: torch.Tensor,
+        block_mask: torch.Tensor,
         diffusion_mode: torch.Tensor,
     ) -> List[torch.Tensor]:
-        return CheckpointFunction.apply(self._core_forward, True, hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode)
+        return CheckpointFunction.apply(self._core_forward, True, hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, block_mask, diffusion_mode)
 
     def forward(
         self,
@@ -874,17 +841,17 @@ class LlamaDecoderLayer(nn.Module):
         position_ids: Union[torch.Tensor, TensorPointer],
         mask_positions: Union[torch.Tensor, TensorPointer],
         noise_weights: Union[torch.Tensor, TensorPointer],
-        doc_ids: Union[torch.Tensor, TensorPointer],
+        block_mask: Union[torch.Tensor, TensorPointer],
         diffusion_mode: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
 
         if self.recompute_layer and not isinstance(hidden_states, TensorPointer):
-            hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode = self._checkpointed_forward(
-                hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode
+            hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, block_mask, diffusion_mode = self._checkpointed_forward(
+                hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, block_mask, diffusion_mode
             )
         else:
-            hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode = self._core_forward(
-                hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, doc_ids, diffusion_mode
+            hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, block_mask, diffusion_mode = self._core_forward(
+                hidden_states, sequence_mask, position_ids, mask_positions, noise_weights, block_mask, diffusion_mode
             )
 
         return {
@@ -893,7 +860,7 @@ class LlamaDecoderLayer(nn.Module):
             "position_ids": position_ids,
             "mask_positions": mask_positions,
             "noise_weights": noise_weights,
-            "doc_ids": doc_ids,
+            "block_mask": block_mask,
             "diffusion_mode": diffusion_mode,
         }
 
@@ -902,6 +869,7 @@ class DiffusionModule(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
+        self._debug_counter = 0  # Counter for debug logging
 
     def forward(self, input_ids: torch.Tensor, input_mask: torch.Tensor):
         device = input_ids.device
@@ -913,6 +881,8 @@ class DiffusionModule(nn.Module):
         mask_positions = torch.empty(0, device=device)
         noise_weights = torch.empty(0, device=device)
         doc_ids = torch.empty(0, device=device)
+        block_ids = torch.empty(0, device=device)
+        block_mask = None  # FlexAttention BlockMask
         diffusion_mode = torch.tensor(0, dtype=torch.int, device=device)
 
         if self.config.diffusion_config is not None:
@@ -921,7 +891,7 @@ class DiffusionModule(nn.Module):
             
             # Debug: Check for diffusion trigger
             if torch.distributed.get_rank() == 0:
-                print(f"DEBUG: DiffusionModule - config present. Diffusion: {diff_config.diffusion}, Block: {diff_config.block_diffusion}")
+                print(f"DEBUG: DiffusionModule - config present. Diffusion: {diff_config.diffusion}, Block: {diff_config.block_diffusion}", flush=True)
 
             if diff_config.block_diffusion:
                 diffusion_mode = torch.tensor(2, dtype=torch.int, device=device)
@@ -939,6 +909,14 @@ class DiffusionModule(nn.Module):
                 )
                 doc_ids = d_ids
                 
+                # 1.5. Create FlexAttention block mask (requires batch_size=1)
+                if batch_size != 1:
+                    raise RuntimeError(f"FlexAttention requires batch_size=1, got {batch_size}")
+                if FLEX_ATTENTION_AVAILABLE:
+                    block_mask = create_flex_block_mask(doc_ids.squeeze(0), block_ids.squeeze(0))
+                else:
+                    raise RuntimeError("FlexAttention not available. Requires PyTorch 2.5+")
+                
                 # 2. Apply block-wise masking
                 masked_input, mask_pos, t_per_position = apply_block_masking(
                     input_ids, block_ids, t_lower, t_upper, mask_token_id, is_training=True
@@ -954,6 +932,51 @@ class DiffusionModule(nn.Module):
                 
                 # 5. Noise weights
                 noise_weights = 1.0 / (t_per_position + 1e-3)
+                
+                # DEBUG: Comprehensive logging for block diffusion (limited to first 10 iterations)
+                self._debug_counter += 1
+                should_log = torch.distributed.get_rank() == 0 and self._debug_counter <= 10
+                
+                if should_log:
+                    num_masked = mask_positions.sum().item()
+                    total_tokens = mask_positions.numel()
+                    mask_ratio = num_masked / total_tokens
+                    
+                    # t statistics
+                    t_min = t_per_position.min().item()
+                    t_max = t_per_position.max().item()
+                    t_mean = t_per_position.mean().item()
+                    
+                    # noise weight statistics
+                    nw_min = noise_weights.min().item()
+                    nw_max = noise_weights.max().item()
+                    nw_mean = noise_weights.mean().item()
+                    
+                    # block_ids statistics
+                    num_blocks = block_ids.max().item() + 1
+                    
+                    # Check if mask_token_id appears correctly
+                    num_mask_tokens = (masked_input == mask_token_id).sum().item()
+                    
+                    print(f"\n{'='*60}")
+                    print(f"DEBUG DiffusionModule (Block Diffusion) - iter {self._debug_counter}:")
+                    print(f"  Config: block_size={block_size}, t_lower={t_lower}, t_upper={t_upper}")
+                    print(f"  Input shape: {input_ids.shape}, mask_token_id={mask_token_id}")
+                    print(f"  Num blocks: {num_blocks}")
+                    print(f"  Masking: {num_masked}/{total_tokens} = {mask_ratio:.1%}")
+                    print(f"  Mask tokens in noisy input: {num_mask_tokens}")
+                    print(f"  t values: min={t_min:.3f}, max={t_max:.3f}, mean={t_mean:.3f}")
+                    print(f"  Noise weights: min={nw_min:.3f}, max={nw_max:.3f}, mean={nw_mean:.3f}")
+                    print(f"  Position IDs shape: {position_ids.shape}")
+                    print(f"  Noisy input shape: {noisy_input_ids.shape}")
+                    
+                    # Sample first few tokens for verification
+                    print(f"  Sample input_ids[0,:10]: {input_ids[0,:10].tolist()}")
+                    print(f"  Sample masked_input[0,:10]: {masked_input[0,:10].tolist()}")
+                    print(f"  Sample mask_positions[0,:10]: {mask_positions[0,:10].tolist()}")
+                    print(f"  Sample block_ids[0,:10]: {block_ids[0,:10].tolist()}")
+                    print(f"  Sample t_per_position[0,:10]: {[f'{x:.2f}' for x in t_per_position[0,:10].tolist()]}")
+                    print(f"{'='*60}\n")
                 
             elif diff_config.diffusion:
                 diffusion_mode = torch.tensor(1, dtype=torch.int, device=device)
@@ -996,6 +1019,8 @@ class DiffusionModule(nn.Module):
             "mask_positions": mask_positions,
             "noise_weights": noise_weights,
             "doc_ids": doc_ids,
+            "block_ids": block_ids,
+            "block_mask": block_mask,
             "diffusion_mode": diffusion_mode
         }
 
@@ -1056,14 +1081,14 @@ class LlamaModel(nn.Module):
             p2p=self.p2p,
             module_builder=DiffusionModule,
             module_kwargs={"config": config},
-            module_input_keys={"input_ids", "input_mask"},
+            module_input_keys={"input_ids", "input_mask", "position_ids"},
             module_output_keys={
                 "noisy_input_ids", 
                 "input_mask_updated", 
                 "position_ids", 
                 "mask_positions", 
                 "noise_weights", 
-                "doc_ids", 
+                "block_mask",
                 "diffusion_mode"
             },
         )
@@ -1104,7 +1129,7 @@ class LlamaModel(nn.Module):
                         "position_ids", 
                         "mask_positions", 
                         "noise_weights", 
-                        "doc_ids", 
+                        "block_mask",
                         "diffusion_mode"
                     },
                     module_output_keys={
@@ -1113,7 +1138,7 @@ class LlamaModel(nn.Module):
                         "position_ids", 
                         "mask_positions", 
                         "noise_weights", 
-                        "doc_ids", 
+                        "block_mask",
                         "diffusion_mode"
                     },
                 )
@@ -1159,17 +1184,19 @@ class LlamaModel(nn.Module):
         self,
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
+        position_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ):
-        return self.forward_with_hidden_states(input_ids=input_ids, input_mask=input_mask)[0]
+        return self.forward_with_hidden_states(input_ids=input_ids, input_mask=input_mask, position_ids=position_ids)[0]
 
     def forward_with_hidden_states(
         self,
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
+        position_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ):
         # all tensors are optional as most ranks don't need anything from the dataloader.
 
-        diff_output = self.diffusion_block(input_ids=input_ids, input_mask=input_mask)
+        diff_output = self.diffusion_block(input_ids=input_ids, input_mask=input_mask, position_ids=position_ids)
         
         # Use noisy_input_ids for embedding if available (Rank 0), or pass through whatever came out
         # Actually, PipelineBlock forward returns dict.
@@ -1193,7 +1220,7 @@ class LlamaModel(nn.Module):
             "position_ids": diff_output["position_ids"],
             "mask_positions": diff_output["mask_positions"],
             "noise_weights": diff_output["noise_weights"],
-            "doc_ids": diff_output["doc_ids"],
+            "block_mask": diff_output["block_mask"],
             "diffusion_mode": diff_output["diffusion_mode"],
         }
         for encoder_block in self.decoder:
@@ -1205,7 +1232,7 @@ class LlamaModel(nn.Module):
 
         fp32_sharded_logits = self.cast_to_fp32(x=sharded_logits)["output"]
 
-        return fp32_sharded_logits, hidden_states, hidden_encoder_states["diffusion_mode"], hidden_encoder_states["mask_positions"], hidden_encoder_states["noise_weights"], hidden_encoder_states["doc_ids"]
+        return fp32_sharded_logits, hidden_states, hidden_encoder_states["diffusion_mode"], hidden_encoder_states["mask_positions"], hidden_encoder_states["noise_weights"]
 
     def get_block_compute_costs(self):
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
@@ -1255,6 +1282,7 @@ class Loss(nn.Module):
     def __init__(self, tp_pg: dist.ProcessGroup):
         super().__init__()
         self.tp_pg = tp_pg
+        self._debug_counter = 0  # Counter for debug logging
 
     def forward(
         self,
@@ -1279,34 +1307,81 @@ class Loss(nn.Module):
             if mode == 2: # Block Diffusion
                 # For block diffusion, input is concatenated [noisy, clean]. logits are [2L, B, V].
                 # We need to split logits
-                seq_len = label_ids.shape[1] # This is original seq_len
+                seq_len = label_ids.shape[1] # This is original seq_len (L)
+                batch_size = label_ids.shape[0]
                 # logits are [2*seq_len, batch, vocab]
                 
                 noisy_logits = sharded_logits[:seq_len, :, :] # [L, B, V]
-                clean_logits = sharded_logits[seq_len:, :, :] # [L, B, V]
+                # clean_logits = sharded_logits[seq_len:, :, :] # [L, B, V] - not used for loss
                 
-                # Reshape for loss calculation: [B, L, V]
-                noisy_logits = noisy_logits.transpose(0, 1).contiguous()
-                clean_logits = clean_logits.transpose(0, 1).contiguous()
+                # CRITICAL: Autoregressive alignment
+                # logits[i] predicts token at position i+1
+                # We need to align: logits[:-1] with labels[1:]
+                noisy_logits_aligned = noisy_logits[:-1, :, :]  # [L-1, B, V] - drop last logit
+                labels_aligned = label_ids[:, 1:].transpose(0, 1).contiguous()  # [L-1, B] - drop first label
+                mask_positions_aligned = mask_positions[:, 1:]  # [B, L-1] - mask status for predicted positions
+                noise_weights_aligned = noise_weights[:, 1:]  # [B, L-1] - weights for predicted positions
                 
-                # 1. Diffusion Loss on noisy part
-                # Labels are the original tokens (label_ids)
-                # We only compute loss on masked positions
+                # 1. Diffusion Loss on noisy part (aligned)
                 diff_loss = sharded_cross_entropy(
-                    noisy_logits.transpose(0, 1), # [L, B, V]
-                    label_ids.transpose(0, 1).contiguous(),
+                    noisy_logits_aligned, # [L-1, B, V]
+                    labels_aligned,  # [L-1, B]
                     group=self.tp_pg,
                     dtype=torch.float
-                ).transpose(0, 1) # [B, L]
+                ).transpose(0, 1) # [B, L-1]
                 
-                masked_diff_loss = (diff_loss * mask_positions).sum() / (mask_positions.sum() + 1e-5)
+                # Reference implementation divides by total sequence length, not mask count:
+                # loss = (losses * weights * mask).sum() / input_seq.size(0)
+                # For batched input, we divide by total tokens (batch_size * seq_len)
+                # Note: keep using original seq_len for normalization to match reference
+                total_tokens = batch_size * seq_len
                 
-                # Weight by noise level (simple reweighting)
-                # noise_weights is [B, L]
-                weighted_diff_loss = (diff_loss * mask_positions * noise_weights).sum() / (mask_positions.sum() + 1e-5)
+                # Convert mask_positions to float for multiplication (using aligned mask)
+                mask_float = mask_positions_aligned.float()
                 
-                # 2. Reconstruction Loss on clean part (AR loss or just consistency?)
-                # For now, let's just use diffusion loss
+                # Weight by noise level and apply mask (using aligned weights)
+                weighted_diff_loss = (diff_loss * mask_float * noise_weights_aligned).sum() / total_tokens
+                
+                # Debug logging (limited to first 10 iterations)
+                self._debug_counter += 1
+                should_log = torch.distributed.get_rank() == 0 and self._debug_counter <= 10
+                
+                if should_log:
+                    num_masked = mask_float.sum().item()
+                    mask_ratio = num_masked / total_tokens
+                    avg_weight = (noise_weights_aligned * mask_float).sum().item() / (num_masked + 1e-8)
+                    avg_loss_per_masked = (diff_loss * mask_float).sum().item() / (num_masked + 1e-8)
+                    
+                    # Additional debug: unweighted loss and AR-like loss for comparison
+                    unweighted_loss = (diff_loss * mask_float).sum().item() / total_tokens
+                    
+                    # Loss on ALL tokens (like AR) for reference
+                    all_token_loss = diff_loss.mean().item()
+                    
+                    # Loss on non-masked tokens (should be low if model predicts well)
+                    non_mask_float = 1 - mask_float
+                    num_non_masked = non_mask_float.sum().item()
+                    if num_non_masked > 0:
+                        avg_loss_non_masked = (diff_loss * non_mask_float).sum().item() / num_non_masked
+                    else:
+                        avg_loss_non_masked = 0.0
+                    
+                    print(f"\n{'='*60}")
+                    print(f"DEBUG Block Diffusion Loss (Llama, iter {self._debug_counter}):")
+                    print(f"  Shapes (aligned): logits={noisy_logits_aligned.shape}, labels={labels_aligned.shape}, mask={mask_positions_aligned.shape}")
+                    print(f"  Original shapes: labels={label_ids.shape}, mask={mask_positions.shape}")
+                    print(f"  mask_ratio={mask_ratio:.3f} ({int(num_masked)}/{total_tokens} tokens)")
+                    print(f"  noise_weights_aligned: min={noise_weights_aligned.min().item():.3f}, max={noise_weights_aligned.max().item():.3f}, avg_on_masked={avg_weight:.3f}")
+                    print(f"  Per-token loss (masked only): {avg_loss_per_masked:.4f}")
+                    print(f"  Per-token loss (non-masked): {avg_loss_non_masked:.4f}")
+                    print(f"  Per-token loss (ALL tokens): {all_token_loss:.4f}")
+                    print(f"  Unweighted loss (ref formula w/o weights): {unweighted_loss:.4f}")
+                    print(f"  Final weighted loss: {weighted_diff_loss.item():.4f}")
+                    print(f"  ")
+                    print(f"  Expected: final_loss ≈ mask_ratio × avg_loss_per_masked × avg_weight")
+                    print(f"            = {mask_ratio:.3f} × {avg_loss_per_masked:.3f} × {avg_weight:.3f} = {mask_ratio * avg_loss_per_masked * avg_weight:.4f}")
+                    print(f"{'='*60}\n")
+                
                 loss = weighted_diff_loss
                 return {"loss": loss}
                 
@@ -1426,10 +1501,12 @@ class LlamaForTraining(NanotronModel):
         input_mask: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        position_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         sharded_logits, _, diffusion_mode, mask_positions, noise_weights, doc_ids = self.model.forward_with_hidden_states(
             input_ids=input_ids,
             input_mask=input_mask,
+            position_ids=position_ids,
         )
         loss = self.loss(
             sharded_logits=sharded_logits,
@@ -1569,7 +1646,7 @@ def get_flops(
     decoder_ffn_1_flops_fwd = 4 * num_layers * batch_size * seq_len * (hidden_size) * ffn_hidden_size
     ## 2nd layer
     decoder_ffn_2_flops_fwd = 2 * num_layers * batch_size * seq_len * (ffn_hidden_size) * hidden_size
-
+    
     decoder_flops_fwd = (
         decoder_qkv_proj_flops_fwd
         + decoder_qk_logits_flops_fwd

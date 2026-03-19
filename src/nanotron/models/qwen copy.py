@@ -1,15 +1,29 @@
 from typing import Dict, List, Optional, Tuple, Union
-
+import os
 import torch
 import torch.nn.functional as F
 from flash_attn.modules.mha import flash_attn_varlen_kvpacked_func
 from torch import nn
 from torch.utils.checkpoint import CheckpointFunction
 
+# Import FlexAttention for block diffusion
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+    flex_attention = None
+    create_block_mask = None
+
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import Config, ParallelismArgs
-from nanotron.config.models_config import Qwen2Config, RandomInit, SpectralMupInit
+from nanotron.config.models_config import Qwen2Config, RandomInit, SpectralMupInit, DiffusionArgs
+from nanotron.block_diffusion import (
+    transition,
+    create_flex_block_mask,
+    FLEX_ATTENTION_AVAILABLE
+)
 from nanotron.logging import log_rank
 from nanotron.models import NanotronModel
 from nanotron.nn.activations import ACT2FN
@@ -33,20 +47,12 @@ from nanotron.scaling.parametrization import SpectralMupParametrizator, Standard
 from nanotron.logging import LogMixin
 from nanotron.nn.llama3_ring_attention import llama3_flash_attn_varlen_kvpacked_func, llama3_flash_attn_prepare_cu_seqlens
 logger = logging.get_logger(__name__)
-import os
 
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-FLEX_ATTENTION_AVAILABLE = True
-create_block_mask = torch.compile(create_block_mask, dynamic=False)
-flex_attention = torch.compile(flex_attention, dynamic=False)
-
-DEBUG=False
+DEBUG = False
 if os.environ.get("DEBUG", "false") == "true":
     DEBUG = True
     print("DEBUG mode enabled")
-DEBUG_INTERVAL=1024
 
-from nanotron.block_diffusion import create_flex_block_mask
 
 class CoreAttention(nn.Module):
     """Core attention module that can use different attention implementations"""
@@ -67,86 +73,55 @@ class CoreAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.local_num_heads = self.num_heads // tp_pg.size()
         self.local_num_kv_heads = self.num_kv_heads // tp_pg.size()
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )  # Important for transformers's `sdpa_attention_forward`
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self._attn_implementation = config._attn_implementation
         self.cp_pg = cp_pg
         self.sliding_window_size = config.sliding_window_size
-        self.simple_causal_mask = True  # Use simple causal mask instead of computing custom attention mask if not document masking / sliding window
+        self.simple_causal_mask = True
         self.flex_attention_mask = config.flex_attention_mask if hasattr(config, "flex_attention_mask") else None
-        self.is_diffusion = config.diffusion_config and config.diffusion_config.diffusion
 
     def forward(
         self,
-        query_states: torch.Tensor,  # [b*s, num_heads, head_dim]
-        key_states: torch.Tensor,  # [b*s, num_kv_heads, head_dim]
-        value_states: torch.Tensor,  # [b*s, num_kv_heads, head_dim]
-        position_ids: torch.Tensor,  # [b*s]
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
         seq_length: Optional[int],
         attention_mask: Optional[torch.Tensor] = None,
         dropout: float = 0.0,
         **kwargs,
     ):
-        """Forward pass applying the chosen attention implementation"""
-        # Get the appropriate attention function
         attention_func = ALL_ATTENTION_FUNCTIONS[self._attn_implementation]
-
-        # Initialize variables for attention parameters
         cu_seqlens = kwargs.get("cu_seqlens", None)
 
-        # Shape tensors according to attention implementation
         if self._attn_implementation == "ring_flash_triton":
             query_states = query_states.view(-1, seq_length, self.local_num_heads, self.head_dim)
             key_states = key_states.view(-1, seq_length, self.local_num_kv_heads, self.head_dim)
             value_states = value_states.view(-1, seq_length, self.local_num_kv_heads, self.head_dim)
         elif self._attn_implementation == "ring":
-            # Warning: Since this uses _flash_attn_varlen_forward make sure we count padding tokens in cu_seqlens
             query_states = query_states.view(-1, self.local_num_heads, self.head_dim)
             key_states = key_states.view(-1, self.local_num_kv_heads, self.head_dim)
             value_states = value_states.view(-1, self.local_num_kv_heads, self.head_dim)
         else:
-            # Process attention mask based on implementation
-            if self.simple_causal_mask and not self.is_diffusion:
-                assert attention_mask is None, "Simple causal mask is not supported with custom attention mask"
-                assert self.sliding_window_size is None, "Simple causal mask is not supported with sliding window"
-            elif attention_mask is None and position_ids is not None:
-                # Determine if we need to create an attention mask from position_ids
-                if self._attn_implementation == "flex_attention" and self.sliding_window_size is not None:
-                    # For FlexAttention with sliding window, we don't need an explicit mask
-                    # The mask_mod function will handle it
-                    pass
-                elif not self.is_diffusion:
-                    # For other implementations, generate the attention mask if needed
-                    # Only calculate if cu_seqlens wasn't passed
-                    if cu_seqlens is None:
-                        attention_mask, cu_seqlens = get_attention_mask(position_ids, seq_length=seq_length)
-
-                    if attention_mask is not None:
-                        # Add batch and head dimensions for proper broadcasting
-                        attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
+            raise NotImplementedError(f"Attention implementation {self._attn_implementation} not implemented")
 
         attn_output = attention_func(
             self,
-            query_states,  # [b, num_heads, seq_len, head_dim]
-            key_states,  # [b, num_kv_heads, seq_len, head_dim]
-            value_states,  # [b, num_kv_heads, seq_len, head_dim]
-            attention_mask,  # [b, num_heads, seq_len, seq_len]
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
             max_seqlen=seq_length,
             dropout=dropout,
-            scaling=None,  # by default, scaling is head_dim**-0.5
+            scaling=None,
             sliding_window=self.sliding_window_size,
             ring_pg=self.cp_pg,
-            position_ids=position_ids if self._attn_implementation == "flex_attention" else None,
             document_ids=kwargs.get("document_ids", None) if self._attn_implementation == "flex_attention" else None,
             flex_attention_mask=self.flex_attention_mask if self._attn_implementation == "flex_attention" else None,
-            causal=not self.is_diffusion,
-            **kwargs,  # Pass remaining kwargs
+            **kwargs,
         )[0]
 
-        return attn_output.view(
-            -1, self.local_num_heads * self.head_dim
-        )  # [b*s, num_heads, head_dim] -> [b*s, num_heads*head_dim]
+        return attn_output.view(-1, self.local_num_heads * self.head_dim)
+
 
 class Qwen2Attention(LogMixin, nn.Module):
     def __init__(
@@ -179,9 +154,6 @@ class Qwen2Attention(LogMixin, nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.local_q_size = self.local_num_heads * self.head_dim
         self.local_kv_size = self.local_num_kv_heads * self.head_dim
-
-        self.is_block_diffusion = config.diffusion_config and config.diffusion_config.block_diffusion   
-        self.is_diffusion = config.diffusion_config and config.diffusion_config.diffusion
 
         # TP mode configuration
         tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
@@ -226,7 +198,7 @@ class Qwen2Attention(LogMixin, nn.Module):
                 max_seq_len=config.max_position_embeddings,
                 base=config.rope_theta,
                 interleaved=config.rope_interleaved,
-                seq_len_scaling_factor=config.rope_seq_len_scaling_factor,
+                seq_len_scaling_factor=1,
                 fused=config._fused_rotary_emb,
             )
         self.attention = CoreAttention(config, tp_pg, cp_pg, layer_idx)
@@ -239,61 +211,45 @@ class Qwen2Attention(LogMixin, nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,  # [batch_size*seq_length, hidden_size]
-        position_ids: torch.Tensor,  # [batch_size, seq_length] where -1 is padding
-        cu_seqlens: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,  # Added cu_seqlens argument
-        block_mask: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+        cu_seqlens: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
+        diffusion_mode: Optional[torch.Tensor] = None,
+        block_mask=None,
     ):
-        # [0, 1, 2, 3, 4, 0, 1, 2, -1, -1, -1] # 2 documents with 5 and 3 tokens then padding
-        # [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] # 1 document with 11 tokens
-        # [0, 1, 2, 3, 4, 5, 6, 7, 8, -1, -1] # 1 document with 10 tokens then padding
-        # Replace -1 with 0 in position_ids to mark every padding token as a separate sequence. Ideally we want to get rid of padding tokens from qkv
-        # position_ids = position_ids.masked_fill(position_ids == -1, 0)
-        seq_length = position_ids.shape[1] // self.cp_pg_size # in CP, position_ids are global
-        # Keep original position_ids shape for return, flatten for internal use
-        position_ids = position_ids.view(-1)  # [batch_size*seq_length]
+        # Compute seq_length from cu_seqlens
+        if cu_seqlens is not None:
+            if isinstance(cu_seqlens, dict):
+                # llama3_ring_attention case
+                seq_length = cu_seqlens["max_seqlen_q"] // self.cp_pg_size
+            else:
+                # Regular flash attention case - compute from cu_seqlens differences
+                if cu_seqlens.numel() > 1:
+                    seq_length = int((cu_seqlens[1] - cu_seqlens[0]).item())
+                else:
+                    # Fallback: compute from hidden_states shape
+                    seq_length = hidden_states.shape[0] // self.cp_pg_size
+        else:
+            # Fallback: compute from hidden_states shape (assumes batch_size=1)
+            seq_length = hidden_states.shape[0] // self.cp_pg_size
 
         qkv = self.qkv_proj(hidden_states)
-
-        if self.is_block_diffusion:
+        
+        if diffusion_mode is not None and diffusion_mode.item() == 2:
             attn_output = self._forward_block_diffusion(qkv, seq_length, block_mask)
         else:
-            if self._use_qkv_packed:
-                attn_output = self._forward_packed(qkv, seq_length, position_ids, cu_seqlens)
-            else:
-                q, k, v = qkv.split(
-                    [self.local_q_size, self.local_kv_size, self.local_kv_size], dim=-1
-                )  # [batch_size*seq_length, q_size], [batch_size*seq_length, kv_size]
-                q = q.view(-1, self.local_num_heads, self.head_dim)  # [b*s, num_heads, head_dim]
-                k = k.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
-                v = v.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
-        # else:
-        #     q, k, v = qkv.split(
-        #         [self.local_q_size, self.local_kv_size, self.local_kv_size], dim=-1
-        #     )  # [batch_size*seq_length, q_size], [batch_size*seq_length, kv_size]
-        #     q = q.view(-1, self.local_num_heads, self.head_dim)  # [b*s, num_heads, head_dim]
-        #     k = k.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
-        #     v = v.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
-        #     if self.config.no_rope_layer is None or (self.layer_idx + 1) % self.config.no_rope_layer != 0:
-        #         rotary_pos_emb = self.rotary_emb(
-        #             position_ids=position_ids if not self.simple_causal_mask else None, seq_length=seq_length
-        #         )  # [b*s, dim] or [seq_length, dim]
-        #         q = self.rotary_emb.apply_rotary_pos_emb(
-        #             q, rotary_pos_emb, seq_length=seq_length
-        #         )  # [b*s, num_heads, head_dim]
-        #         k = self.rotary_emb.apply_rotary_pos_emb(
-        #             k, rotary_pos_emb, seq_length=seq_length
-        #         )  # [b*s, num_kv_heads, head_dim]
-        #     else:
-        #         log_rank(f"skipping rotary for layer {self.layer_idx + 1}", logger=logger, level=logging.DEBUG, rank=0)
-        #     attn_output = self.attention(
-        #         q, k, v, position_ids=position_ids, seq_length=seq_length, cu_seqlens=cu_seqlens
-        #     )
-        output = self.o_proj(attn_output)
-        # Return original position_ids shape
-        return {"hidden_states": output, "position_ids": position_ids.view(-1, seq_length)}
+            causal = True
+            if diffusion_mode is not None and diffusion_mode.item() == 1:
+                causal = False
 
-    def _forward_packed(self, qkv, seq_length, position_ids, cu_seqlens):
+            if self._use_qkv_packed:
+                attn_output = self._forward_packed(qkv, seq_length, cu_seqlens, causal=causal)
+            else:
+                raise NotImplementedError("Non-packed QKV not implemented for Qwen2Attention")
+                
+        output = self.o_proj(attn_output)
+        return {"hidden_states": output}
+
+    def _forward_packed(self, qkv, seq_length, cu_seqlens, causal=True):
         assert cu_seqlens is not None, "cu_seqlens must be provided for packed attention"
         q = qkv[..., : self.local_num_heads * self.head_dim]  # Not contiguous, similar to flash_attn
         kv = qkv[..., self.local_num_heads * self.head_dim :]  # Not contiguous, similar to flash_attn
@@ -310,7 +266,7 @@ class Qwen2Attention(LogMixin, nn.Module):
 
         q = q.view(-1, self.local_num_heads, self.head_dim)
         kv = kv.view(-1, 2, self.local_num_kv_heads, self.head_dim)
-        max_seqlen = seq_length  # TODO: should this be max position_ids?
+        max_seqlen = seq_length
 
 
         if self.config._attn_implementation == "llama3_ring_attention":
@@ -325,7 +281,7 @@ class Qwen2Attention(LogMixin, nn.Module):
                 local_k_slice=cu_seqlens["local_k_slice"],
                 dropout_p=0.0,
                 softmax_scale=None,
-                causal=not self.is_diffusion,
+                causal=causal,
                 alibi_slopes=None,
                 window_size=(self.sliding_window_size - 1, 0) if self.sliding_window_size is not None else (-1, -1),
                 deterministic=False,
@@ -336,7 +292,6 @@ class Qwen2Attention(LogMixin, nn.Module):
             assert cu_seqlens.dtype == torch.int32
             assert max_seqlen is not None
             assert isinstance(max_seqlen, int)
-            # print(f"DEBUG: FlashAttention - causal={not self.is_diffusion}") # This is indeed False when --diffusion
             attn_output = flash_attn_varlen_kvpacked_func(
                 q,
                 kv,
@@ -346,7 +301,7 @@ class Qwen2Attention(LogMixin, nn.Module):
                 max_seqlen,
                 0.0,
                 softmax_scale=None,
-                causal=not self.is_diffusion,
+                causal=causal,
                 alibi_slopes=None,
                 window_size=(self.sliding_window_size - 1, 0) if self.sliding_window_size is not None else (-1, -1),
                 deterministic=False,
@@ -355,10 +310,8 @@ class Qwen2Attention(LogMixin, nn.Module):
 
         if self.log_attn_probs:
             attn_output, attn_probs, _ = attn_output
-            # log attn_probs
             self.tbi_logger({"attn_probs": attn_probs})
-        # flash_attn use rearrange instead of reshape https://github.com/Dao-AILab/flash-attention/blob/1a58058a6da83bd7baaf4c512e8a1abe0240bb77/flash_attn/modules/mha.py#L730
-        return attn_output.reshape(-1, self.local_num_heads * self.head_dim)  # [b*s, num_heads*head_dim]
+        return attn_output.reshape(-1, self.local_num_heads * self.head_dim)
 
     def _forward_block_diffusion(
         self, 
@@ -366,72 +319,68 @@ class Qwen2Attention(LogMixin, nn.Module):
         seq_length: int, 
         block_mask,
     ) -> torch.Tensor:
-        """
-        Optimized block diffusion forward pass.
-        
-        Memory optimizations:
-        - Reshape instead of split/concat for RoPE application
-        - Use repeat_interleave for GQA expansion (more efficient than unsqueeze+expand+reshape)
-        - Minimize intermediate tensor allocations
-        """
         if not FLEX_ATTENTION_AVAILABLE:
             raise RuntimeError("FlexAttention not available. Requires PyTorch 2.5+")
         
         if block_mask is None:
-            raise RuntimeError("block_mask is None but block diffusion is enabled")
+            raise RuntimeError("block_mask is None but diffusion_mode=2")
         
-        # Single slicing operation instead of split
+        q = qkv[..., : self.local_num_heads * self.head_dim]
+        kv = qkv[..., self.local_num_heads * self.head_dim :]
+        
         total_tokens = qkv.shape[0]
         batch_size = total_tokens // seq_length
-        half_seq_length = seq_length // 2
         
-        # Reshape with proper dimensions: [batch_size, seq_length, features]
-        q = qkv[..., : self.local_num_heads * self.head_dim].view(
-            batch_size, seq_length, self.local_num_heads, self.head_dim
-        )
-        kv = qkv[..., self.local_num_heads * self.head_dim :].view(
-            batch_size, seq_length, 2, self.local_num_kv_heads, self.head_dim
-        )
+        q = q.view(batch_size, seq_length, self.local_num_heads, self.head_dim)
+        kv = kv.view(batch_size, seq_length, 2, self.local_num_kv_heads, self.head_dim)
         
         if self.config.no_rope_layer is None or (self.layer_idx + 1) % self.config.no_rope_layer != 0:
-            # Optimization: Reshape to treat noisy/clean halves as separate batch items
-            # This eliminates split/concat operations
-            # [batch_size, 2*half_seq, ...] -> [batch_size*2, half_seq, ...]
-            q = q.view(batch_size * 2, half_seq_length, self.local_num_heads, self.head_dim)
-            kv = kv.view(batch_size * 2, half_seq_length, 2, self.local_num_kv_heads, self.head_dim)
+            # For block diffusion, split into noisy and clean halves, apply RoPE separately to each
+            half_seq_length = seq_length // 2
             
-            # Apply RoPE once to both halves simultaneously (treated as larger batch)
-            q, kv = self.rotary_emb(
-                q, kv, seqlen_offset=0, max_seqlen=half_seq_length
+            # Split q and kv into noisy and clean halves
+            q_noisy = q[:, :half_seq_length, :, :]  # [batch_size, half_seq_length, num_heads, head_dim]
+            q_clean = q[:, half_seq_length:, :, :]  # [batch_size, half_seq_length, num_heads, head_dim]
+            kv_noisy = kv[:, :half_seq_length, :, :, :]  # [batch_size, half_seq_length, 2, num_kv_heads, head_dim]
+            kv_clean = kv[:, half_seq_length:, :, :, :]  # [batch_size, half_seq_length, 2, num_kv_heads, head_dim]
+            
+            # Both halves start from position 0, so use seqlen_offset=0 for both
+            seqlen_offset = 0
+            max_seqlen = half_seq_length
+            
+            # Apply RoPE to noisy half (positions 0 to half_seq_length-1)
+            q_noisy, kv_noisy = self.rotary_emb(
+                q_noisy, kv_noisy, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen
             )
             
-            # Reshape back to [batch_size, seq_length, ...]
-            q = q.view(batch_size, seq_length, self.local_num_heads, self.head_dim)
-            kv = kv.view(batch_size, seq_length, 2, self.local_num_kv_heads, self.head_dim)
+            # Apply RoPE to clean half (also positions 0 to half_seq_length-1)
+            q_clean, kv_clean = self.rotary_emb(
+                q_clean, kv_clean, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen
+            )
+            
+            # Concatenate back
+            q = torch.cat([q_noisy, q_clean], dim=1)  # [batch_size, seq_length, num_heads, head_dim]
+            kv = torch.cat([kv_noisy, kv_clean], dim=1)  # [batch_size, seq_length, 2, num_kv_heads, head_dim]
         
-        # Extract k, v from kv tensor
-        k = kv[:, :, 0]  # [batch_size, seq_length, num_kv_heads, head_dim]
-        v = kv[:, :, 1]  # [batch_size, seq_length, num_kv_heads, head_dim]
+        k = kv[:, :, 0, :, :]
+        v = kv[:, :, 1, :, :]
         
-        # GQA: Expand KV heads to match Q heads if needed
         if self.local_num_kv_heads != self.local_num_heads:
             n_rep = self.local_num_heads // self.local_num_kv_heads
-            # repeat_interleave is more efficient than unsqueeze+expand+reshape
-            k = k.repeat_interleave(n_rep, dim=2)  # [batch_size, seq_length, num_heads, head_dim]
-            v = v.repeat_interleave(n_rep, dim=2)  # [batch_size, seq_length, num_heads, head_dim]
+            k = k.unsqueeze(3).expand(-1, -1, -1, n_rep, -1).reshape(batch_size, seq_length, self.local_num_heads, self.head_dim)
+            v = v.unsqueeze(3).expand(-1, -1, -1, n_rep, -1).reshape(batch_size, seq_length, self.local_num_heads, self.head_dim)
         
-        # Transpose for attention: [batch_size, num_heads, seq_length, head_dim]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # Apply flex attention with block mask
         attn_output = flex_attention(q, k, v, block_mask=block_mask)
         
-        # Reshape back: [batch_size, seq_length, num_heads, head_dim] -> [total_tokens, hidden_dim]
-        attn_output = attn_output.transpose(1, 2).reshape(-1, self.local_num_heads * self.head_dim)
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(-1, self.local_num_heads * self.head_dim)
         
         return attn_output
+
 
 class Qwen2MLP(nn.Module):
     def __init__(
@@ -716,15 +665,20 @@ class Qwen2DecoderLayer(nn.Module):
 
     def _core_forward(
         self,
-        hidden_states: Union[torch.Tensor, TensorPointer],  # [batch_size*seq_length, hidden_size]
-        position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
+        hidden_states: Union[torch.Tensor, TensorPointer],
         cu_seqlens: Union[torch.Tensor, TensorPointer],
-        block_mask: Union[torch.Tensor, TensorPointer],
+        diffusion_mode: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        block_mask=None,
     ) -> List[Union[torch.Tensor, TensorPointer]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        output = self.attn(hidden_states=hidden_states, position_ids=position_ids, cu_seqlens=cu_seqlens, block_mask=block_mask)
+        output = self.attn(
+            hidden_states=hidden_states, 
+            cu_seqlens=cu_seqlens, 
+            diffusion_mode=diffusion_mode,
+            block_mask=block_mask,
+        )
         hidden_states = output["hidden_states"]
         hidden_states = hidden_states + residual
 
@@ -733,35 +687,37 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states=hidden_states)["hidden_states"]
         hidden_states = hidden_states + residual
 
-        return hidden_states, position_ids, cu_seqlens, block_mask
+        return hidden_states, cu_seqlens, diffusion_mode, block_mask
 
     def _checkpointed_forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        block_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return CheckpointFunction.apply(self._core_forward, True, hidden_states, position_ids, cu_seqlens, block_mask)
+        diffusion_mode: Optional[torch.Tensor] = None,
+        block_mask=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        return CheckpointFunction.apply(self._core_forward, True, hidden_states, cu_seqlens, diffusion_mode, block_mask)
 
     def forward(
         self,
         hidden_states: Union[torch.Tensor, TensorPointer],
-        position_ids: Union[torch.Tensor, TensorPointer],
         cu_seqlens: Union[torch.Tensor, TensorPointer],
-        block_mask: Union[torch.Tensor, TensorPointer],
+        diffusion_mode: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        block_mask=None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         if self.recompute_layer and not isinstance(hidden_states, TensorPointer):
-            hidden_states, position_ids, cu_seqlens, block_mask = self._checkpointed_forward(
-                hidden_states, position_ids, cu_seqlens, block_mask
+            hidden_states, cu_seqlens, diffusion_mode, block_mask = self._checkpointed_forward(
+                hidden_states, cu_seqlens, diffusion_mode, block_mask
             )
         else:
-            hidden_states, position_ids, cu_seqlens, block_mask = self._core_forward(hidden_states, position_ids, cu_seqlens, block_mask)
+            hidden_states, cu_seqlens, diffusion_mode, block_mask = self._core_forward(
+                hidden_states, cu_seqlens, diffusion_mode, block_mask
+            )
 
         return {
             "hidden_states": hidden_states,
-            "position_ids": position_ids,
             "cu_seqlens": cu_seqlens,
+            "diffusion_mode": diffusion_mode,
             "block_mask": block_mask,
         }
 
@@ -778,10 +734,135 @@ class Embedding(nn.Module):
         )
         self.pg = tp_pg
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):  # [batch_size, seq_length]
+    def forward(self, input_ids: torch.Tensor):  # [batch_size, seq_length]
         input_ids = input_ids.view(-1)  # [batch_size*seq_length]
         input_embeds = self.token_embedding(input_ids)  # [batch_size*seq_length, hidden_size]
-        return {"input_embeds": input_embeds, "position_ids": position_ids}
+        return {"input_embeds": input_embeds}
+
+
+class DiffusionModule(nn.Module):
+    def __init__(self, config: Qwen2Config):
+        super().__init__()
+        self.config = config
+
+    def calculate_block_id_and_doc_id(self, input_seq: torch.Tensor, eos_token_id: int, block_size: int):
+        if input_seq.ndim == 2:
+            input_seq = input_seq.squeeze(0)
+        assert input_seq.ndim == 1, f"input_seq.ndim is not 1: {input_seq.ndim} ,shape is {input_seq.shape}"
+
+        # construct attention rules & block mask
+        # CHANGE 1: Create a mask where True marks the START of a document
+        # We shift EOS right by 1, so the token AFTER an EOS becomes a "start".
+        is_doc_start = (input_seq == eos_token_id).roll(1, 0)
+        is_doc_start[0] = True  # The first token is always the start of a document
+
+        doc_id = is_doc_start.cumsum(0)
+        p = torch.arange(input_seq.size(0), device=input_seq.device)
+        pos_id = p - torch.where(is_doc_start, p, -1).cummax(0).values
+        block_id = pos_id // block_size + doc_id * len(input_seq)
+        block_id = torch.cumsum(block_id != block_id.roll(1, 0), 0) - 1
+
+        return pos_id, block_id, doc_id
+
+
+    def forward(self, input_ids: torch.Tensor, input_mask: torch.Tensor):
+        device = input_ids.device
+        
+        # Default outputs (dummies for P2P)
+        noisy_input_ids = input_ids
+        input_mask_updated = input_mask
+        mask_positions = torch.empty(0, device=device)
+        noise_weights = torch.empty(0, device=device)
+        doc_ids = torch.empty(0, device=device)
+        block_ids = torch.empty(0, device=device)
+        block_mask = None
+        t_per_position = None
+        diffusion_mode = torch.tensor(0, dtype=torch.int, device=device)
+
+        if self.config.diffusion_config is not None:
+            diff_config = self.config.diffusion_config
+            batch_size, seq_len = input_ids.shape
+
+            if diff_config.block_diffusion:
+                diffusion_mode = torch.tensor(2, dtype=torch.int, device=device)
+                
+                block_size = diff_config.block_size
+                mask_token_id = diff_config.mask_token_id
+                t_lower = diff_config.t_lower
+                t_upper = diff_config.t_upper
+                bos_token_id = self.config.bos_token_id
+                eos_token_id = self.config.eos_token_id
+                
+                # 1. Calculate block IDs
+                pos_id, block_id, doc_id = self.calculate_block_id_and_doc_id(input_seq=input_ids, eos_token_id=eos_token_id, block_size=block_size)
+                
+                # 1.5. Create FlexAttention block mask (requires batch_size=1)
+                if batch_size != 1:
+                    raise RuntimeError(f"FlexAttention requires batch_size=1, got {batch_size}")
+                block_mask = create_flex_block_mask(doc_id.squeeze(0), block_id.squeeze(0))
+                # 2. Apply block-wise masking
+                noise_range = (t_lower, t_upper) if self.training else (0.0, 1.0)
+                rand = torch.rand_like(input_ids, dtype=torch.float32)
+                t = torch.empty_like(rand.squeeze(0)).uniform_(*noise_range)[block_id]
+                # ensure taht the t is a tensor with the same shape as block_id
+                t = t.unsqueeze(0)
+                # print(f"shape of t: {t.shape}")
+                # print(f"shape of block_id: {block_id.shape}")
+                # print(f"shape of input_ids: {input_ids.shape}")
+                # print(f"shape of rand: {rand.shape}")
+                # print(f"shape of noisy_input_ids: {noisy_input_ids.shape}")
+                noisy_seq = input_ids.masked_fill(rand >= (1 - t),mask_token_id)
+                # print(f"shape of noisy_seq: {noisy_seq.shape}")
+                noisy_input_ids = torch.cat([noisy_seq, input_ids], dim=1)
+                # print(f"shape of noisy_input_ids: {noisy_input_ids.shape}")
+                t_per_position = t
+
+                # # 3. Concatenate [noisy, clean]
+                # noisy_input_ids = torch.cat([masked_input, input_ids], dim=1)
+                # input_mask_updated = torch.cat([input_mask, input_mask], dim=1)
+                
+                
+                # # 5. Noise weights
+                # noise_weights = 1.0 / (t_per_position + 1e-3)
+                
+            elif diff_config.diffusion:
+                diffusion_mode = torch.tensor(1, dtype=torch.int, device=device)
+                
+                mask_token_id = diff_config.mask_token_id
+                sampling_eps = diff_config.sampling_eps
+                maskable_mask = input_mask.bool()
+                
+                # Sample noise level until we get at least one masked token
+                # This prevents missing gradients for the token embedding layer
+                max_attempts = 100
+                for attempt in range(max_attempts):
+                    t = (1 - sampling_eps) * torch.rand(batch_size, device=device) + sampling_eps
+                    noisy_input_ids = transition(input_ids, t[:, None], maskable_mask, mask_token_id)
+                    mask_positions = (noisy_input_ids == mask_token_id).long()
+                    
+                    # Check if we have at least one masked token
+                    if mask_positions.sum().item() > 0:
+                        break
+                    
+                    # Safety: if we've tried many times and still no mask, force higher noise
+                    if attempt == max_attempts - 1:
+                        t = torch.full((batch_size,), 0.5, device=device)
+                        noisy_input_ids = transition(input_ids, t[:, None], maskable_mask, mask_token_id)
+                        mask_positions = (noisy_input_ids == mask_token_id).long()
+                
+                noise_weights = torch.reciprocal(t)
+
+        return {
+            "noisy_input_ids": noisy_input_ids,
+            "input_mask_updated": input_mask_updated,
+            "mask_positions": mask_positions,
+            "noise_weights": noise_weights,
+            # "doc_ids": doc_ids,
+            # "block_ids": block_ids,
+            "block_mask": block_mask,
+            "diffusion_mode": diffusion_mode,
+            "t_per_position": t_per_position
+        }
 
 
 class Qwen2Model(nn.Module):
@@ -805,6 +886,22 @@ class Qwen2Model(nn.Module):
             parallel_config.tp_linear_async_communication if parallel_config is not None else False
         )
 
+        self.diffusion_block = PipelineBlock(
+            p2p=self.p2p,
+            module_builder=DiffusionModule,
+            module_kwargs={"config": config},
+            module_input_keys={"input_ids", "input_mask"},
+            module_output_keys={
+                "noisy_input_ids", 
+                "input_mask_updated", 
+                "mask_positions", 
+                "noise_weights", 
+                "block_mask",
+                "diffusion_mode",
+                "t_per_position"
+            },
+        )
+
         self.token_position_embeddings = PipelineBlock(
             p2p=self.p2p,
             module_builder=Embedding,
@@ -813,8 +910,8 @@ class Qwen2Model(nn.Module):
                 "parallel_config": parallel_config,
                 "tp_pg": parallel_context.tp_pg,
             },
-            module_input_keys={"input_ids", "position_ids"},
-            module_output_keys={"input_embeds", "position_ids"},
+            module_input_keys={"input_ids"},
+            module_output_keys={"input_embeds"},
         )
 
         # Create decoder layers
@@ -830,8 +927,8 @@ class Qwen2Model(nn.Module):
                         "cp_pg": parallel_context.cp_pg,
                         "layer_idx": layer_idx,
                     },
-                    module_input_keys={"hidden_states", "position_ids", "cu_seqlens", "block_mask"},
-                    module_output_keys={"hidden_states", "position_ids", "cu_seqlens", "block_mask"},
+                    module_input_keys={"hidden_states", "cu_seqlens", "diffusion_mode", "block_mask"},
+                    module_output_keys={"hidden_states", "cu_seqlens", "diffusion_mode", "block_mask"},
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -865,79 +962,43 @@ class Qwen2Model(nn.Module):
     def forward(
         self,
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
-        position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
-        block_mask: Optional[torch.Tensor] = None,  # block_mask is None by default
+        input_mask: Union[torch.Tensor, TensorPointer] = None,
     ):
-        if DEBUG and isinstance(position_ids, torch.Tensor) and dist.get_rank(self.parallel_context.world_pg) == 0:
-             # Check for debug flag or just print occasionally
-             # We can use a static counter or just print every time if it's not too fast. 
-             # Since training loop is fast, let's try to limit it.
-             if not hasattr(self, "_debug_counter"):
-                 self._debug_counter = 0
-             self._debug_counter += 1
+        assert input_mask is None, f"input_mask is not None: {input_mask}"
+        # Debug: Check for EOS/BOS tokens in input_ids
+        if DEBUG and torch.distributed.get_rank() == 0:
+            bos_id = self.config.bos_token_id
+            eos_id = self.config.eos_token_id
+            
+            check_ids = input_ids
+            if isinstance(check_ids, torch.Tensor):
+                num_bos = (check_ids == bos_id).sum().item()
+                num_eos = (check_ids == eos_id).sum().item()
+                
+                print(f"DEBUG: Input Analysis - BOS({bos_id}): {num_bos}, EOS({eos_id}): {num_eos}, Shape: {check_ids.shape}")
+                if num_eos == 0 and num_bos == 0:
+                    print("DEBUG: WARNING - No BOS/EOS found in batch! Documents might be merged or truncated.")
+
+        diff_output = self.diffusion_block(input_ids=input_ids, input_mask=input_mask)
+        noisy_input_ids = diff_output["noisy_input_ids"]
              
-             if self._debug_counter % 10 == 1:
-                 num_zeros = (position_ids == 0).sum().item()
-                 print(f"\n[DEBUG] position_ids check (step {self._debug_counter}):")
-                 print(f"  Shape: {position_ids.shape}")
-                 print(f"  Number of document starts (0s): {num_zeros}")
-                 print(f"  First 20 position_ids: {position_ids.view(-1)[:20].tolist()}")
-                 if num_zeros > position_ids.shape[0]: # More zeros than batch size implies intradoc resets
-                     print("  => Intradoc masking seems ACTIVE (multiple resets per sequence)")
-                 else:
-                     print("  => Intradoc masking seems INACTIVE (or 1 doc per sequence)")
-
-                 # Check document boundaries content
-                 if isinstance(input_ids, torch.Tensor):
-                     from transformers import AutoTokenizer
-                     if not hasattr(self, "_debug_tokenizer"):
-                         print("  [DEBUG] Loading tokenizer for boundary check...")
-                         self._debug_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-                     
-                     # Look at the first sequence
-                     seq_idx = 0
-                     pos_seq = position_ids[seq_idx]
-                     inp_seq = input_ids[seq_idx]
-                     
-                     # Find boundaries (where pos_id == 0), skip index 0
-                     boundaries = (pos_seq == 0).nonzero(as_tuple=True)[0]
-                     boundaries = [b.item() for b in boundaries if b.item() > 0]
-                     
-                     if boundaries:
-                         print(f"  => Found {len(boundaries)} internal boundaries in sequence 0. Checking first few:")
-                         for b_idx in boundaries[:3]:
-                             start = max(0, b_idx - 20)
-                             end = min(len(inp_seq), b_idx + 20)
-                             
-                             prev_chunk = inp_seq[start:b_idx].cpu()
-                             next_chunk = inp_seq[b_idx:end].cpu()
-                             
-                             prev_text = self._debug_tokenizer.decode(prev_chunk)
-                             next_text = self._debug_tokenizer.decode(next_chunk)
-                             
-                             print(f"    Boundary @ {b_idx}:")
-                             print(f"      PRE tokens: {prev_chunk.tolist()}")
-                             print(f"      PRE text: {repr(prev_text)}")
-                             print(f"      POST tokens: {next_chunk.tolist()}")
-                             print(f"      POST text: {repr(next_text)}")
-                     else:
-                         print("  => No internal boundaries in sequence 0 to check.")
-
-        output = self.token_position_embeddings(input_ids=input_ids, position_ids=position_ids)
-        # Compute cu_seqlens
+        output = self.token_position_embeddings(input_ids=noisy_input_ids)
+        
         cu_seqlens: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None
-        if position_ids.numel() > 0:
-            start_indices = torch.where(position_ids.view(-1) == 0)[0]
-            cu_seqlens = torch.cat(
-                [start_indices, torch.tensor([position_ids.numel()], dtype=torch.int32, device=start_indices.device)]
-            ).to(torch.int32)
+        if isinstance(noisy_input_ids, torch.Tensor) and noisy_input_ids.numel() > 0:
+            # Compute cu_seqlens from noisy_input_ids shape
+            # Assume each batch item is a single contiguous sequence
+            batch_size, seq_length = noisy_input_ids.shape
+            total_tokens = batch_size * seq_length
+            
+            # Create cu_seqlens assuming one sequence per batch item
+            cu_seqlens = torch.arange(0, total_tokens + 1, seq_length, dtype=torch.int32, device=noisy_input_ids.device)
 
-            # llama3 ring attention
             if self.config._attn_implementation == "llama3_ring_attention":
-                local_sequence_length = input_ids.shape[1]
-                sequence_length = position_ids.shape[1]
-                assert sequence_length == local_sequence_length * self.parallel_context.cp_pg.size(), f"sequence_length={sequence_length} must be equal to local_sequence_length={local_sequence_length} * cp_pg.size()={self.parallel_context.cp_pg.size()}"
-                assert sequence_length % (2 * self.parallel_context.cp_pg.size()) == 0, f"Sequence length {sequence_length} must be divisible by {2 * self.parallel_context.cp_pg.size()} when using llama3 ring attention"
+                local_sequence_length = seq_length
+                total_sequence_length = total_tokens
+                assert total_sequence_length == local_sequence_length * self.parallel_context.cp_pg.size()
+                assert total_sequence_length % (2 * self.parallel_context.cp_pg.size()) == 0
                 (
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -945,7 +1006,7 @@ class Qwen2Model(nn.Module):
                 max_seqlen_k,
                 local_k_slice,
                 ) = llama3_flash_attn_prepare_cu_seqlens(
-                    cu_seqlens, # global cu_seqlens
+                    cu_seqlens,
                     causal=True,
                     rank=self.parallel_context.cp_pg.rank(),
                     world_size=self.parallel_context.cp_pg.size(),
@@ -957,35 +1018,23 @@ class Qwen2Model(nn.Module):
                     "max_seqlen_k": max_seqlen_k,
                     "local_k_slice": local_k_slice,
                 }
-
+        
         decoder_states = {
             "hidden_states": output["input_embeds"],
-            "position_ids": output["position_ids"],
             "cu_seqlens": cu_seqlens,
-            "block_mask": block_mask,
+            "diffusion_mode": diff_output["diffusion_mode"],
+            "block_mask": diff_output["block_mask"],
         }
 
         for decoder_layer in self.decoder:
             decoder_states = decoder_layer(**decoder_states)
 
-        # if block diffusion, we only need the first half of the sequence length (noisy part).
-        # hidden_states is [B*2L, hidden_size], so reshape to [B, 2L, H], slice to [B, L, H], flatten back.
-        if self.config.diffusion_config and self.config.diffusion_config.block_diffusion:
-            batch_size = input_ids.shape[0]
-            hidden_size = decoder_states["hidden_states"].shape[-1]
-            seq_len = input_ids.shape[1] // 2  # L (half of the 2L concatenated input)
-            decoder_states["hidden_states"] = (
-                decoder_states["hidden_states"]
-                .view(batch_size, 2 * seq_len, hidden_size)[:, :seq_len, :]
-                .contiguous()
-                .view(batch_size * seq_len, hidden_size)
-            )
-
         hidden_states = self.final_layer_norm(input=decoder_states["hidden_states"])["hidden_states"]
 
         sharded_logits = self.lm_head(x=hidden_states)["logits"]
 
-        return sharded_logits
+        return sharded_logits, diff_output["diffusion_mode"], diff_output["mask_positions"], diff_output["noise_weights"], diff_output["t_per_position"]
+
 
     def get_block_compute_costs(self):
         """Computes the compute cost of each block in the model for load balancing."""
@@ -1034,194 +1083,82 @@ def masked_mean(loss, label_mask, dtype):
 
 
 class Loss(nn.Module):
-    def __init__(self, tp_pg: dist.ProcessGroup):
+    def __init__(self, tp_pg: dist.ProcessGroup, mask_token_id: Optional[int] = None):
         super().__init__()
         self.tp_pg = tp_pg
-
-    def forward(
-        self,
-        sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
-        label_ids: torch.Tensor,  # [batch_size, seq_length]
-        label_mask: torch.Tensor,  # [batch_size, seq_length]
-    ) -> Dict[str, torch.Tensor]:
-        sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
-        loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
-        loss = masked_mean(loss, label_mask, dtype=torch.float)
-        return {"loss": loss}
-
-class BlockDiffusionLoss(Loss):
-    _loss_step = 0  # class-level counter: increments every forward (microbatch)
-
-    def __init__(self, tp_pg: dist.ProcessGroup, mask_token_id: int, shift: bool = False):
-        super().__init__(tp_pg)
+        self._debug_counter = 0  # Counter for debug logging
         self.mask_token_id = mask_token_id
-        self.shift = shift
-
-    @staticmethod
-    def _is_debug_step():
-        """Return True on every 10th loss forward, rank 0 only."""
-        if not DEBUG:
-            return False
-        try:
-            if dist.get_rank() != 0:
-                return False
-        except RuntimeError:
-            pass
-        return BlockDiffusionLoss._loss_step % DEBUG_INTERVAL == 0
 
     def forward(
         self,
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
-        t_per_position: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        # sharded_logits is [B*L, V_shard] (model already slices to noisy half), label_ids is [B, L]
-        sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)  # [B, L, V_shard]
-        _should_log = BlockDiffusionLoss._is_debug_step()
-
-        if self.shift:
-            # Autoregressive alignment: logits[i] predicts token[i+1]
-            logits_aligned = sharded_logits[:, :-1, :]  # [B, L-1, V]
-            labels_aligned = label_ids[:, 1:]  # [B, L-1]
-            mask_aligned = label_mask[:, 1:]  # [B, L-1]
-            t_aligned = t_per_position[:, 1:]  # [B, L-1]
-            
-            per_token_loss = sharded_cross_entropy(logits_aligned, labels_aligned.contiguous(), group=self.tp_pg, dtype=torch.float)
-            weights = (1.0 / (t_aligned + 1e-3)).type_as(logits_aligned)
-            loss = (per_token_loss * weights * mask_aligned).sum() / (label_ids.size(1) - 1)
-
-            if _should_log:
-                with torch.no_grad():
-                    self._log_loss_diagnostics(
-                        "SHIFT", per_token_loss, weights, mask_aligned,
-                        logits_aligned, labels_aligned, t_aligned, loss,
-                        label_ids.size(1) - 1,
-                    )
-
-        else:
-            per_token_loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
-            weights = (1.0 / (t_per_position + 1e-3)).type_as(sharded_logits)
-            loss = (per_token_loss * weights * label_mask).sum() / label_ids.size(1)
-
-            if _should_log:
-                with torch.no_grad():
-                    self._log_loss_diagnostics(
-                        "NO-SHIFT", per_token_loss, weights, label_mask,
-                        sharded_logits, label_ids, t_per_position, loss,
-                        label_ids.size(1),
-                    )
-
-        BlockDiffusionLoss._loss_step += 1
-        return {"loss": loss}
-
-    @staticmethod
-    def _log_loss_diagnostics(
-        mode_name, per_token_loss, weights, mask, logits, labels, t_vals, final_loss, denom,
-    ):
-        """Print detailed loss diagnostics. Called under torch.no_grad() and rank-0 guard."""
-        _s = BlockDiffusionLoss._loss_step
-        B = labels.shape[0]
-        seq_dim = labels.shape[1]
-        num_masked = mask.sum().item()
-        num_unmasked = (seq_dim * B) - num_masked
-
-        masked_bool = mask.bool()
-        masked_loss = per_token_loss[masked_bool]
-        unmasked_loss = per_token_loss[~masked_bool]
-        weighted_masked = (per_token_loss * weights)[masked_bool]
-        w_masked = weights[masked_bool]
-        t_masked = t_vals[masked_bool]
-        t_unmasked = t_vals[~masked_bool]
-
-        preds = logits.argmax(dim=-1)  # [B, seq_dim]
-        correct_masked = (preds == labels)[masked_bool].float()
-        correct_unmasked = (preds == labels)[~masked_bool].float()
-
-        print(f"\n{'='*80}")
-        print(f"[DEBUG loss_step={_s}] BlockDiffusionLoss ({mode_name}) — rank 0")
-        print(f"{'='*80}")
-        print(f"  Shapes: logits={list(logits.shape)}, labels={list(labels.shape)}")
-        print(f"  Vocab size (sharded): {logits.shape[-1]}")
-        print(f"  Masked positions: {num_masked:.0f}/{seq_dim*B} ({num_masked/(seq_dim*B):.2%})")
-        print(f"  --- Raw CE Loss (before weighting) ---")
-        print(f"    Overall:   mean={per_token_loss.mean():.4f}, std={per_token_loss.std():.4f}")
-        if num_masked > 0:
-            print(f"    Masked:    mean={masked_loss.mean():.4f}, std={masked_loss.std():.4f}, "
-                  f"min={masked_loss.min():.4f}, max={masked_loss.max():.4f}")
-        if num_unmasked > 0:
-            print(f"    Unmasked:  mean={unmasked_loss.mean():.4f}, std={unmasked_loss.std():.4f}, "
-                  f"min={unmasked_loss.min():.4f}, max={unmasked_loss.max():.4f}")
-        print(f"  --- Noise level t ---")
-        if num_masked > 0:
-            print(f"    At masked:   mean={t_masked.mean():.4f}, min={t_masked.min():.4f}, max={t_masked.max():.4f}")
-        if num_unmasked > 0:
-            print(f"    At unmasked: mean={t_unmasked.mean():.4f}, min={t_unmasked.min():.4f}, max={t_unmasked.max():.4f}")
-        print(f"  --- 1/t Weights (at masked positions) ---")
-        if num_masked > 0:
-            print(f"    mean={w_masked.mean():.4f}, std={w_masked.std():.4f}, "
-                  f"min={w_masked.min():.4f}, max={w_masked.max():.4f}")
-        print(f"  --- Weighted Loss (CE * 1/t) at masked positions ---")
-        if num_masked > 0:
-            print(f"    mean={weighted_masked.mean():.4f}, std={weighted_masked.std():.4f}, "
-                  f"min={weighted_masked.min():.4f}, max={weighted_masked.max():.4f}")
-        print(f"  --- Top-1 Accuracy ---")
-        if num_masked > 0:
-            print(f"    Masked:   {correct_masked.mean():.4f} ({correct_masked.sum():.0f}/{len(correct_masked)})")
-        if num_unmasked > 0:
-            print(f"    Unmasked: {correct_unmasked.mean():.4f} ({correct_unmasked.sum():.0f}/{len(correct_unmasked)})")
-        print(f"  --- Final Loss ---")
-        print(f"    loss={final_loss.item():.6f}, denominator={denom}")
-        print(f"  --- Logit Statistics ---")
-        print(f"    mean={logits.mean():.4f}, std={logits.std():.4f}, "
-              f"min={logits.min():.4f}, max={logits.max():.4f}")
-        # Sample predictions at masked positions
-        mask_indices = mask[0].nonzero(as_tuple=True)[0]
-        if len(mask_indices) > 0:
-            show_n = min(5, len(mask_indices))
-            print(f"  --- Sample predictions at first {show_n} masked positions (batch 0) ---")
-            for idx in mask_indices[:show_n]:
-                pos = idx.item()
-                pred_id = preds[0, pos].item()
-                true_id = labels[0, pos].item()
-                ce = per_token_loss[0, pos].item()
-                w = weights[0, pos].item()
-                t_v = t_vals[0, pos].item()
-                top5_ids = logits[0, pos].topk(5).indices.tolist()
-                print(f"    pos={pos}: true={true_id}, pred={pred_id}, "
-                      f"CE={ce:.4f}, w(1/t)={w:.4f}, t={t_v:.4f}, top5={top5_ids}")
-        print(f"{'='*80}\n")
-
-class VanillaDiffusionLoss(Loss):
-    def __init__(self, tp_pg: dist.ProcessGroup, mask_token_id: int, shift: bool = False):
-        super().__init__(tp_pg)
-        self.mask_token_id = mask_token_id
-        self.shift = shift
-
-    def forward(
-        self,
-        sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
-        label_ids: torch.Tensor,  # [batch_size, seq_length]
-        label_mask: torch.Tensor,  # [batch_size, seq_length]
-        dsigma: torch.Tensor, # [batch_size]
+        mask_positions: Optional[torch.Tensor] = None,
+        noise_weights: Optional[torch.Tensor] = None,
+        t_per_position: Optional[torch.Tensor] = None,
+        diffusion_mode: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
         
-        if self.shift:
-            # Shift so that logits[i] predicts label[i+1]
-            # We discard the last logit and the first label/mask
-            sharded_logits = sharded_logits[:, :-1, :]
-            label_ids = label_ids[:, 1:]
-            label_mask = label_mask[:, 1:]
-            
-        per_token_loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
+        if diffusion_mode is not None and diffusion_mode.item() > 0:
+            mode = diffusion_mode.item()
+            loss = sharded_cross_entropy(
+                sharded_logits.transpose(0, 1), # [L, B, V] -> [B, L, V] ... wait, sharded_cross_entropy takes [L, B, V]
+                label_ids.transpose(0, 1).contiguous(),
+                group=self.tp_pg,
+                dtype=torch.float
+            ).transpose(0, 1) # [B, L]
 
-        label_mask = label_mask.bool()
-        loss = per_token_loss * label_mask
+            if mode == 2: # Block Diffusion
+                mask = (label_ids == self.mask_token_id)
+                weights = (1.0 / (t_per_position + 1e-3)).type_as(sharded_logits)
+                loss = (loss * weights * mask).sum() / label_ids.size(0)
 
-        loss = (dsigma.view(-1, 1) * loss).sum() / label_mask.sum().clamp(min=1)
+                return {"loss": loss}
+            elif mode == 1: # Vanilla Diffusion
+                 # Slice to align targets: we need to check if the TARGET (next token) was masked.
+                 # Input: x_0, ..., x_{S-1}. Labels: x_1, ..., x_S.
+                 # Mask positions corresponds to Input (x_0...x_{S-1}).
+                 # We want to know if x_1...x_S were masked.
+                 # We have mask status for x_1...x_{S-1} (from mask_positions[1:]).
+                 # We DO NOT have mask status for x_S (it wasn't in input).
+                 # So we must drop the last prediction step.
+                 
+                 logits_sliced = sharded_logits[:, :-1, :] # Predicts x_1...x_{S-1}
+                 labels_sliced = label_ids[:, :-1]         # x_1...x_{S-1}
+                 mask_sliced = mask_positions[:, 1:]       # Mask status of x_1...x_{S-1}
+                 
+                 loss = sharded_cross_entropy(
+                    logits_sliced.transpose(0, 1),
+                    labels_sliced.transpose(0, 1).contiguous(),
+                    group=self.tp_pg,
+                    dtype=torch.float
+                 ).transpose(0, 1) # [B, S-1]
 
+                 mask = mask_sliced.float().type_as(loss)
+                 dsigma = noise_weights # [B]
+                 
+                 loss_per_token = loss * mask
+                 if dsigma.dim() == 1:
+                     dsigma = dsigma.unsqueeze(1)
+                 # ensure taht disgma is not a single number 
+                 if dsigma.dim() == 0:
+                    raise ValueError("dsigma must be a tensor, not a single number")
+                 
+                 loss_weighted = (loss_per_token.sum(dim=1) * dsigma.squeeze()).sum()
+                 
+                 total_masked = mask.sum()
+                 if total_masked > 0:
+                     loss_val = loss_weighted / total_masked
+                 else:
+                     loss_val = torch.tensor(0.0, device=loss.device, requires_grad=True)
+                 return {"loss": loss_val}
+        
+        loss = sharded_cross_entropy(sharded_logits.transpose(0, 1), label_ids.transpose(0, 1).contiguous(), group=self.tp_pg, dtype=torch.float).transpose(0, 1)
+        loss = masked_mean(loss, label_mask, dtype=torch.float)
         return {"loss": loss}
+
 
 class LossWithZLoss(Loss):
     def __init__(self, tp_pg: dist.ProcessGroup, z_loss_coefficient: float):
@@ -1257,202 +1194,51 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         # Choose the appropriate loss class based on config
         loss_kwargs = {
             "tp_pg": parallel_context.tp_pg,
+            "mask_token_id": config.diffusion_config.mask_token_id,
         }
         if config.z_loss_enabled:
             loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
 
-        if config.diffusion_config and config.diffusion_config.block_diffusion:
-            loss_kwargs["mask_token_id"] = config.diffusion_config.mask_token_id
-            loss_kwargs["shift"] = config.diffusion_config.shift
-            self.loss = PipelineBlock(
-                p2p=self.model.p2p,
-                module_builder=BlockDiffusionLoss,
-                module_kwargs=loss_kwargs,
-                module_input_keys={
-                    "sharded_logits",
-                    "label_ids",
-                    "label_mask",
-                    "t_per_position",
-                },
-                module_output_keys={"loss"},
-            )
-        elif config.diffusion_config and config.diffusion_config.diffusion:
-            loss_kwargs["mask_token_id"] = config.diffusion_config.mask_token_id
-            loss_kwargs["shift"] = config.diffusion_config.shift
-            self.loss = PipelineBlock(
-                p2p=self.model.p2p,
-                module_builder=VanillaDiffusionLoss,
-                module_kwargs=loss_kwargs,
-                module_input_keys={
-                    "sharded_logits",
-                    "label_ids",
-                    "label_mask",
-                    "dsigma",
-                },
-                module_output_keys={"loss"},
-            )
-        else:
-            self.loss = PipelineBlock(
-                p2p=self.model.p2p,
-                module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
-                module_kwargs=loss_kwargs,
-                module_input_keys={
-                    "sharded_logits",
-                    "label_ids",
-                    "label_mask",
-                },
-                module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
-            )
+        self.loss = PipelineBlock(
+            p2p=self.model.p2p,
+            module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
+            module_kwargs=loss_kwargs,
+            module_input_keys={
+                "sharded_logits",
+                "label_ids",
+                "label_mask",
+                "mask_positions", 
+                "noise_weights", 
+                "t_per_position",
+                "diffusion_mode"
+            },
+            module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
+        )
         self.parallel_context = parallel_context
         self.config = config
         self.parallel_config = parallel_config
-    
-    def calculate_block_id_and_doc_id(self, input_seq: torch.Tensor, eos_token_id: int, block_size: int):
-        if input_seq.ndim == 2:
-            input_seq = input_seq.squeeze(0)
-        assert input_seq.ndim == 1, f"input_seq.ndim is not 1: {input_seq.ndim} ,shape is {input_seq.shape}"
-
-        # construct attention rules & block mask
-        # CHANGE 1: Create a mask where True marks the START of a document
-        # We shift EOS right by 1, so the token AFTER an EOS becomes a "start".
-        is_doc_start = (input_seq == eos_token_id).roll(1, 0)
-        is_doc_start[0] = True  # The first token is always the start of a document
-
-        doc_id = is_doc_start.cumsum(0)
-        p = torch.arange(input_seq.size(0), device=input_seq.device)
-        pos_id = p - torch.where(is_doc_start, p, -1).cummax(0).values
-        block_id = pos_id // block_size + doc_id * len(input_seq)
-        block_id = torch.cumsum(block_id != block_id.roll(1, 0), 0) - 1
-
-        return pos_id, block_id, doc_id
-    
-    _fwd_step = 0  # class-level counter: increments every forward (microbatch)
-
-    @staticmethod
-    def _is_debug_step():
-        """Return True on the first microbatch of every 10th optimizer step, rank 0 only."""
-        if not DEBUG:
-            return False
-        try:
-            if dist.get_rank() != 0:
-                return False
-        except RuntimeError:
-            pass  # dist not initialized, allow print
-        # _fwd_step counts microbatches; log on first microbatch only (step % 10 == 0)
-        # We can't easily know n_micro_batches here, so we log when _fwd_step is a multiple of 10
-        # The loss module uses its own aligned counter
-        return Qwen2ForTraining._fwd_step % DEBUG_INTERVAL ==0 
 
     def forward(
         self,
         input_ids: Union[torch.Tensor, TensorPointer],
-        position_ids: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        input_mask: Union[torch.Tensor, TensorPointer] = None,
+        position_ids: Union[torch.Tensor, TensorPointer] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
-        block_mask = None   # block_mask is None by default
-        dsigma = None
-        clean_seq = None
-        if self.config.diffusion_config and self.config.diffusion_config.block_diffusion:
-            _, block_id, doc_id = self.calculate_block_id_and_doc_id(input_seq=input_ids, eos_token_id=self.config.eos_token_id, block_size=self.config.diffusion_config.block_size)
-            block_mask = create_flex_block_mask(doc_id.squeeze(0), block_id.squeeze(0))
-            noise_range = (self.config.diffusion_config.t_lower, self.config.diffusion_config.t_upper) if self.training else (0.0, 1.0)
-            rand = torch.rand_like(input_ids, dtype=torch.float32)
-            t = torch.empty_like(rand.squeeze(0)).uniform_(*noise_range)[block_id]
-            # ensure taht the t is a tensor with the same shape as block_id
-            t = t.unsqueeze(0)
-            clean_seq = input_ids 
-            noisy_seq = input_ids.masked_fill(rand >= (1 - t),self.config.diffusion_config.mask_token_id)
-            input_ids = torch.cat([noisy_seq, input_ids], dim=1)
-            position_ids = torch.cat([position_ids, position_ids], dim=1)
-            t_per_position = t
-            label_mask = (noisy_seq == self.config.diffusion_config.mask_token_id)
-
-            # === DEBUG: Block diffusion input diagnostics (rank 0, every 10 fwd steps) ===
-            if Qwen2ForTraining._is_debug_step():
-                _s = Qwen2ForTraining._fwd_step
-                B, L = clean_seq.shape
-                num_masked = label_mask.sum().item()
-                total_tokens = label_mask.numel()
-                mask_ratio = num_masked / total_tokens
-                num_blocks = block_id.unique().numel()
-                num_docs = doc_id.unique().numel()
-                mask_in_clean = (clean_seq == self.config.diffusion_config.mask_token_id).sum().item()
-                mask_in_noisy = (noisy_seq == self.config.diffusion_config.mask_token_id).sum().item()
-                t_flat = t.squeeze()
-                unique_blocks = block_id.squeeze().unique()
-                t_per_block = torch.stack([t_flat[block_id.squeeze() == b].mean() for b in unique_blocks[:10]])
-
-                print(f"\n{'='*80}")
-                print(f"[DEBUG fwd_step={_s}] Block Diffusion Input Diagnostics (rank 0)")
-                print(f"{'='*80}")
-                print(f"  Shapes: clean_seq={list(clean_seq.shape)}, noisy_seq={list(noisy_seq.shape)}, "
-                      f"model_input={list(input_ids.shape)}")
-                print(f"  Masking: {num_masked}/{total_tokens} tokens masked ({mask_ratio:.2%})")
-                print(f"  mask_token_id={self.config.diffusion_config.mask_token_id}, "
-                      f"mask_in_clean={mask_in_clean} (SHOULD BE 0), mask_in_noisy={mask_in_noisy}")
-                print(f"  Blocks: {num_blocks} unique blocks (block_size={self.config.diffusion_config.block_size}), "
-                      f"{num_docs} docs")
-                print(f"  Noise t: min={t_flat.min():.4f}, max={t_flat.max():.4f}, "
-                      f"mean={t_flat.mean():.4f}, std={t_flat.std():.4f}")
-                print(f"  Noise range: {noise_range}")
-                print(f"  t per block (first 10): {t_per_block.tolist()}")
-                print(f"  Shift mode: {self.config.diffusion_config.shift}")
-                print(f"  Sample tokens (first 20 of batch 0):")
-                print(f"    clean:    {clean_seq[0, :20].tolist()}")
-                print(f"    noisy:    {noisy_seq[0, :20].tolist()}")
-                print(f"    mask:     {label_mask[0, :20].int().tolist()}")
-                print(f"    t:        {[f'{v:.3f}' for v in t[0, :20].tolist()]}")
-                print(f"    block_id: {block_id.squeeze()[:20].tolist()}")
-                print(f"    doc_id:   {doc_id.squeeze()[:20].tolist()}")
-                print(f"{'='*80}\n")
-
-        elif self.config.diffusion_config and self.config.diffusion_config.diffusion:
-            sampling_eps = self.config.diffusion_config.sampling_eps
-            mask_token_id = self.config.diffusion_config.mask_token_id
-            
-            t = (1 - sampling_eps) * torch.rand(input_ids.shape[0], device=input_ids.device) + sampling_eps
-            sigma = t
-            dsigma = torch.reciprocal(t)
-            
-            # maskable_mask = label_mask.bool()
-            move_indices = (torch.rand_like(input_ids, dtype=torch.float) < sigma.view(-1, 1)) 
-            # & maskable_mask
-            
-            clean_seq = input_ids
-            noisy_input_ids = torch.where(move_indices, torch.tensor(mask_token_id, device=input_ids.device), input_ids)
-            
-            input_ids = noisy_input_ids
-            label_mask = move_indices
-
-        Qwen2ForTraining._fwd_step += 1
-
-        sharded_logits = self.model(
+        sharded_logits, diffusion_mode, mask_positions, noise_weights, t_per_position = self.model(
             input_ids=input_ids,
-            position_ids=position_ids,
-            block_mask=block_mask,
+            input_mask=input_mask,
         )
-
-        if self.config.diffusion_config and self.config.diffusion_config.block_diffusion:
-            loss = self.loss(
-                sharded_logits=sharded_logits,
-                label_ids=clean_seq, # for block diffusion, we use the clean sequence as the label
-                label_mask=label_mask,
-                t_per_position=t_per_position,
-            )
-        elif self.config.diffusion_config and self.config.diffusion_config.diffusion:
-            loss = self.loss(
-                sharded_logits=sharded_logits,
-                label_ids=clean_seq,
-                label_mask=label_mask,
-                dsigma=dsigma,
-            )
-        else:
-            loss = self.loss(
-                sharded_logits=sharded_logits,
-                label_ids=label_ids,
-                label_mask=label_mask,
-            )
+        loss = self.loss(
+            sharded_logits=sharded_logits,
+            label_ids=label_ids,
+            label_mask=label_mask,
+            mask_positions=mask_positions,
+            noise_weights=noise_weights,
+            t_per_position=t_per_position,
+            diffusion_mode=diffusion_mode,
+        )
         if self.config.z_loss_enabled:
             return {"loss": loss["loss"], "z_loss": loss["z_loss"]}
         else:
