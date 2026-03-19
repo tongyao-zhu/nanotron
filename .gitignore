@@ -173,4 +173,4 @@ tb_logs/
 nanotron_models/
 commands.sh
 eval_commands.sh
-llama3.2-3b-hf
+llama-3.2-3b-hf
