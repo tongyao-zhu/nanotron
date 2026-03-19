@@ -171,3 +171,6 @@ eval_results/
 tb_logs/
 .nanoset_cache/
 nanotron_models/
+commands.sh
+eval_commands.sh
+llama32_3b_hf
