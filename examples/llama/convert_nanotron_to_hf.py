@@ -117,6 +117,7 @@ def convert_checkpoint_and_save(
     save_path: Path,
     tokenizer_name: Optional[str] = None,
     config_cls: Type[NanotronConfigs] = NanotronLlamaConfig,
+    device: str = "cuda",
 ):
     """Loads the nanotron checkpoint in `checkpoint_path`, creates
     a new huggingface instance, copies the weights from the nanotron checkpoint
@@ -129,9 +130,10 @@ def convert_checkpoint_and_save(
     nanotron_model = load_nanotron_model(
         model_config=model_config,
         checkpoint_path=checkpoint_path,
+        device=torch.device(device),
     )
     # Init huggingface model.
-    with init_on_device_and_dtype(torch.device("cuda"), torch.bfloat16):
+    with init_on_device_and_dtype(torch.device(device), torch.bfloat16):
         model_config_hf = get_hf_config(model_config)
         hf_model = LlamaForCausalLM._from_config(model_config_hf)
 
@@ -144,15 +146,15 @@ def convert_checkpoint_and_save(
     print(f"Model saved to {save_path}")
 
 
-def check_converted_model_generation(save_path: Path):
+def check_converted_model_generation(save_path: Path, device: str = "cuda"):
     """Loads a huggingface model and tokenizer from `save_path` and
     performs a dummy text generation."""
 
     tokenizer = AutoTokenizer.from_pretrained(save_path, trust_remote_code=True)
-    input_ids = tokenizer(TEST_PROMPT, return_tensors="pt")["input_ids"].cuda()
+    input_ids = tokenizer(TEST_PROMPT, return_tensors="pt")["input_ids"].to(device)
     print("Inputs:", tokenizer.batch_decode(input_ids))
 
-    model = LlamaForCausalLM.from_pretrained(save_path, trust_remote_code=True).cuda().bfloat16()
+    model = LlamaForCausalLM.from_pretrained(save_path, trust_remote_code=True).to(device).bfloat16()
     out = model.generate(input_ids, max_new_tokens=100)
     print("Generation (converted): ", tokenizer.batch_decode(out))
 
@@ -163,6 +165,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", type=Path, default="llama-7b-hf", help="Path to save the HF model")
     parser.add_argument("--tokenizer_name", type=str, default="meta-llama/Llama-2-7b-chat-hf")
     parser.add_argument("--config_cls", type=str, default="LlamaConfig", help="Config class to use for conversion (Either LlamaConfig or Qwen2Config)")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use for conversion (cuda or cpu)")
     parser.add_argument("--run_generation", action="store_true", help="Run generation to check if the conversion was successful")
     args = parser.parse_args()
 
@@ -175,9 +178,9 @@ if __name__ == "__main__":
 
     # Convert Nanotron model to HF format.
     convert_checkpoint_and_save(
-        checkpoint_path=args.checkpoint_path, save_path=args.save_path, tokenizer_name=args.tokenizer_name, config_cls=config_cls
+        checkpoint_path=args.checkpoint_path, save_path=args.save_path, tokenizer_name=args.tokenizer_name, config_cls=config_cls, device=args.device
     )
 
     # Check if the conversion was successful by generating some text.
     if args.tokenizer_name is not None and args.run_generation:
-        check_converted_model_generation(save_path=args.save_path)
+        check_converted_model_generation(save_path=args.save_path, device=args.device)

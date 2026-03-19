@@ -1,5 +1,5 @@
 checkpoints:
-  checkpoint_interval: 500
+  checkpoint_interval: ${CHECKPOINT_INTERVAL}
   checkpoints_path: checkpoints-llama32-1b-${SUFFIX}
   checkpoints_path_is_shared_file_system: false
   resume_checkpoint_path: checkpoints-llama32-1b-${SUFFIX}
@@ -68,7 +68,7 @@ model:
     no_rope_layer: null
     _fused_rotary_emb: true
     _fused_rms_norm: true
-    _use_qkv_packed: true
+    _use_qkv_packed: ${USE_QKV_PACKED}
     _use_doc_masking: ${INTRADOC}
     log_attn_probs: false
     ring_attn_heads_k_stride: null
@@ -78,6 +78,7 @@ model:
       mask_token_id: ${MASK_TOKEN_ID}
       block_diffusion: ${IS_BLOCK_DIFFUSION}
       block_size: ${BLOCK_SIZE}
+      shift: ${SHIFT}
 
 optimizer:
   accumulate_grad_in_fp32: ${ACCUMULATE_GRAD_IN_FP32}
@@ -101,7 +102,7 @@ optimizer:
 
 parallelism:
   dp: ${DP}
-  tp: 1
+  tp: ${TP}
   pp: 1
   pp_engine: 1f1b
   expert_parallel_size: 1
@@ -122,7 +123,7 @@ tokens:
   sequence_length: ${SEQUENCE_LENGTH}
   micro_batch_size: ${MICRO_BATCH_SIZE}
   batch_accumulation_per_replica: ${BATCH_ACCUM}
-  train_steps: 25000
+  train_steps: ${MAX_STEP}
   val_check_interval: -1
   limit_val_batches: 0
   limit_test_batches: 0
