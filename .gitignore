@@ -171,6 +171,7 @@ eval_results/
 tb_logs/
 .nanoset_cache/
 nanotron_models/
-commands.sh
-eval_commands.sh
+./commands.sh
+./eval_commands.sh
+./preprocess_commands.sh
 llama-3.2-3b-hf
