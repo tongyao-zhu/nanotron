@@ -373,14 +373,17 @@ if [ "$NNODES" -gt 1 ]; then
         fi
     fi
 
-    TORCHRUN_ARGS="$TORCHRUN_ARGS --nnodes=$NNODES --node_rank=$RANK --rdzv_id=nanotron_job --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
     # if on MY use different setups 
     if [ -f "/home/aiops/zhuty/THIS_IS_MY.txt" ]; then
+        echo "  On MY, using different setup"
         TORCHRUN_ARGS="$TORCHRUN_ARGS --nnodes=$NNODES --node_rank=$RANK --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT"
-    
+        echo "  TORCHRUN_ARGS: $TORCHRUN_ARGS"
         # Force IPv4 to avoid connectivity issues
         export NCCL_SOCKET_FAMILY=AF_INET
         export GLOO_SOCKET_FAMILY=AF_INET
+    else
+        TORCHRUN_ARGS="$TORCHRUN_ARGS --nnodes=$NNODES --node_rank=$RANK --rdzv_id=nanotron_job --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
+
     fi
 
     # Additional NCCL settings for stability
