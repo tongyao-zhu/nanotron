@@ -21,6 +21,7 @@ class DiffusionArgs:
     shift: bool = True
     t_lower: float = 0.3
     t_upper: float = 0.8
+    uniform_loss: bool = False  # Use uniform loss (CE * mask / p_actual) matching the Megatron DiffLM formulation
 
 
 @dataclass

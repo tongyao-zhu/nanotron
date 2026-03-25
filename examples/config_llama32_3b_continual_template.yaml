@@ -79,6 +79,7 @@ model:
       block_diffusion: ${IS_BLOCK_DIFFUSION}
       block_size: ${BLOCK_SIZE}
       shift: ${SHIFT}
+      uniform_loss: ${UNIFORM_LOSS}
 
 optimizer:
   accumulate_grad_in_fp32: ${ACCUMULATE_GRAD_IN_FP32}

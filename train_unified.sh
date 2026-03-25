@@ -90,6 +90,7 @@ export IS_SCRATCH=false
 export LEARNING_RATE=5.0e-05  # default learning rate
 export USE_QKV_PACKED=true
 export SHIFT=false
+export UNIFORM_LOSS=false
 export TP=1  # default tensor parallelism
 # Parse Tensor Parallelism FIRST (needed for DP calculation)
 if [[ "$ADDITIONAL_ARGS" =~ --tp[[:space:]]+([0-9]+) ]]; then
@@ -154,6 +155,12 @@ if [[ "$ADDITIONAL_ARGS" == *"--shift"* ]]; then
     export SHIFT=true
     SUFFIX="${SUFFIX}_shift"
     echo "  Mode: Autoregressive Shift (only predict masked tokens)"
+fi
+
+if [[ "$ADDITIONAL_ARGS" == *"--uniform"* ]]; then
+    export UNIFORM_LOSS=true
+    SUFFIX="${SUFFIX}_uniform"
+    echo "  Mode: Uniform Loss (Megatron DiffLM formulation)"
 fi
 
 # Add TP to suffix if not default

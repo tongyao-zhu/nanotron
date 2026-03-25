@@ -1223,6 +1223,45 @@ class VanillaDiffusionLoss(Loss):
 
         return {"loss": loss}
 
+class UniformDiffusionLoss(Loss):
+    """Diffusion loss matching the Megatron DiffLM formulation from
+    https://github.com/JinjieNi/dlms-are-super-data-learners
+
+    Key differences from VanillaDiffusionLoss:
+    - Weight by 1/p_actual (realized mask fraction) instead of 1/t (sampled probability)
+    - Normalize by total sequence length (not just masked token count)
+    - The 1/p_actual and masked_count/total cancel, giving ~mean(CE) over masked tokens
+    """
+    def __init__(self, tp_pg: dist.ProcessGroup, mask_token_id: int, shift: bool = False):
+        super().__init__(tp_pg)
+        self.mask_token_id = mask_token_id
+        self.shift = shift
+
+    def forward(
+        self,
+        sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
+        label_ids: torch.Tensor,  # [batch_size, seq_length]
+        label_mask: torch.Tensor,  # [batch_size, seq_length]
+        p_actual: torch.Tensor,  # [batch_size, seq_length] — realized mask fraction, broadcast per row
+    ) -> Dict[str, torch.Tensor]:
+        sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
+
+        if self.shift:
+            sharded_logits = sharded_logits[:, :-1, :]
+            label_ids = label_ids[:, 1:]
+            label_mask = label_mask[:, 1:]
+            p_actual = p_actual[:, 1:]
+
+        per_token_loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
+
+        # loss = CE * mask / p_actual, then sum / total_tokens (like Megatron loss_func)
+        label_mask_f = label_mask.float()
+        weighted_loss = per_token_loss * label_mask_f / p_actual.clamp(min=1e-6)
+        total_tokens = torch.tensor(label_ids.shape[1], dtype=torch.float, device=weighted_loss.device)
+        loss = weighted_loss.sum() / (label_ids.shape[0] * total_tokens)
+
+        return {"loss": loss}
+
 class LossWithZLoss(Loss):
     def __init__(self, tp_pg: dist.ProcessGroup, z_loss_coefficient: float):
         super().__init__(tp_pg)
@@ -1279,18 +1318,32 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         elif config.diffusion_config and config.diffusion_config.diffusion:
             loss_kwargs["mask_token_id"] = config.diffusion_config.mask_token_id
             loss_kwargs["shift"] = config.diffusion_config.shift
-            self.loss = PipelineBlock(
-                p2p=self.model.p2p,
-                module_builder=VanillaDiffusionLoss,
-                module_kwargs=loss_kwargs,
-                module_input_keys={
-                    "sharded_logits",
-                    "label_ids",
-                    "label_mask",
-                    "dsigma",
-                },
-                module_output_keys={"loss"},
-            )
+            if config.diffusion_config.uniform_loss:
+                self.loss = PipelineBlock(
+                    p2p=self.model.p2p,
+                    module_builder=UniformDiffusionLoss,
+                    module_kwargs=loss_kwargs,
+                    module_input_keys={
+                        "sharded_logits",
+                        "label_ids",
+                        "label_mask",
+                        "p_actual",
+                    },
+                    module_output_keys={"loss"},
+                )
+            else:
+                self.loss = PipelineBlock(
+                    p2p=self.model.p2p,
+                    module_builder=VanillaDiffusionLoss,
+                    module_kwargs=loss_kwargs,
+                    module_input_keys={
+                        "sharded_logits",
+                        "label_ids",
+                        "label_mask",
+                        "dsigma",
+                    },
+                    module_output_keys={"loss"},
+                )
         else:
             self.loss = PipelineBlock(
                 p2p=self.model.p2p,
@@ -1410,20 +1463,41 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         elif self.config.diffusion_config and self.config.diffusion_config.diffusion:
             sampling_eps = self.config.diffusion_config.sampling_eps
             mask_token_id = self.config.diffusion_config.mask_token_id
-            
-            t = (1 - sampling_eps) * torch.rand(input_ids.shape[0], device=input_ids.device) + sampling_eps
-            sigma = t
-            dsigma = torch.reciprocal(t)
-            
-            # maskable_mask = label_mask.bool()
-            move_indices = (torch.rand_like(input_ids, dtype=torch.float) < sigma.view(-1, 1)) 
-            # & maskable_mask
-            
-            clean_seq = input_ids
-            noisy_input_ids = torch.where(move_indices, torch.tensor(mask_token_id, device=input_ids.device), input_ids)
-            
-            input_ids = noisy_input_ids
-            label_mask = move_indices
+            use_uniform = self.config.diffusion_config.uniform_loss
+
+            if use_uniform:
+                # Megatron DiffLM formulation: t ~ U(0,1), force at-least-one mask,
+                # weight by 1/p_actual (realized mask fraction)
+                b, l = input_ids.shape
+                t = torch.rand(b, device=input_ids.device)
+                move_indices = torch.rand_like(input_ids, dtype=torch.float) < t.view(-1, 1)
+
+                # Guarantee at least one masked token per sequence
+                zero_rows = move_indices.sum(dim=1) == 0
+                if zero_rows.any():
+                    rand_cols = torch.randint(0, l, (zero_rows.sum(),), device=input_ids.device)
+                    move_indices[zero_rows, rand_cols] = True
+
+                # p_actual: realized mask fraction, broadcast to [b, l]
+                p_actual = (move_indices.sum(dim=1, keepdim=True).float() / l).expand_as(move_indices)
+
+                clean_seq = input_ids
+                noisy_input_ids = torch.where(move_indices, mask_token_id, input_ids)
+                input_ids = noisy_input_ids
+                label_mask = move_indices
+                dsigma = None  # not used in uniform mode
+            else:
+                t = (1 - sampling_eps) * torch.rand(input_ids.shape[0], device=input_ids.device) + sampling_eps
+                sigma = t
+                dsigma = torch.reciprocal(t)
+                p_actual = None  # not used in ELBO mode
+
+                move_indices = (torch.rand_like(input_ids, dtype=torch.float) < sigma.view(-1, 1))
+
+                clean_seq = input_ids
+                noisy_input_ids = torch.where(move_indices, mask_token_id, input_ids)
+                input_ids = noisy_input_ids
+                label_mask = move_indices
 
         Qwen2ForTraining._fwd_step += 1
 
@@ -1441,12 +1515,20 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                 t_per_position=t_per_position,
             )
         elif self.config.diffusion_config and self.config.diffusion_config.diffusion:
-            loss = self.loss(
-                sharded_logits=sharded_logits,
-                label_ids=clean_seq,
-                label_mask=label_mask,
-                dsigma=dsigma,
-            )
+            if self.config.diffusion_config.uniform_loss:
+                loss = self.loss(
+                    sharded_logits=sharded_logits,
+                    label_ids=clean_seq,
+                    label_mask=label_mask,
+                    p_actual=p_actual,
+                )
+            else:
+                loss = self.loss(
+                    sharded_logits=sharded_logits,
+                    label_ids=clean_seq,
+                    label_mask=label_mask,
+                    dsigma=dsigma,
+                )
         else:
             loss = self.loss(
                 sharded_logits=sharded_logits,
